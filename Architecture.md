@@ -234,6 +234,107 @@ The POSIX of IntentOS. The standard contract that every agent must implement to 
 
 ---
 
+## Installation & Model Bootstrapping
+
+### Package Size Philosophy
+
+IntentOS ships lean. The core package — shell, agents, routing logic, task interface — is target **~50MB**. No models bundled. No heavy dependencies pre-loaded. The user should be running within 30 seconds of downloading.
+
+Models are pulled on demand, one time, and then live permanently on the user's machine. This keeps the install fast and respects the user's decision about what they want on their device.
+
+### The Bootstrapping Flow
+
+```
+Step 1 — User downloads IntentOS
+         Package size: ~50MB
+         Time: seconds
+                │
+                ▼
+Step 2 — Installer runs
+         ├── Checks for Ollama
+         │   ├── Found → skip
+         │   └── Not found → installs Ollama silently (~100MB)
+         │
+         └── Checks for API key (if cloud-only mode selected)
+                │
+                ▼
+Step 3 — First launch
+         User sees the welcome screen
+         Chooses thinking mode (see FIRST_LAUNCH.md)
+                │
+         ┌──────┴──────┐
+    Local first     Cloud only
+         │               │
+         ▼               ▼
+  Phi-3 Mini pull    API key entry
+  (~2.3GB, one time) (no model download)
+  "Setting up your
+   thinking engine..."
+                │
+                ▼
+Step 4 — First task
+         IntentOS is ready. User types their first instruction.
+         Everything works. No further setup ever required.
+```
+
+### Ollama as the Local Model Engine
+
+IntentOS uses **Ollama** as its local inference engine. Ollama is not bundled — it installs once during setup and then manages all local models going forward.
+
+Why Ollama: it handles hardware detection (CPU vs GPU) automatically, manages model downloads and versioning, runs models as a local HTTP server that IntentOS talks to, and is already installed on millions of machines. IntentOS treats it as infrastructure, not a dependency to fight with.
+
+If the user already has Ollama installed, IntentOS detects this and skips installation entirely.
+
+### Default Model: Phi-3 Mini
+
+Every new IntentOS install starts with **Phi-3 Mini (3.8B)** as the default local model.
+
+Why Phi-3 Mini as the default: it runs on any machine with 4GB RAM, requires no GPU, downloads in under 10 minutes on a standard connection, and handles intent parsing and task routing reliably. It is the lowest barrier entry point that still works well.
+
+### Model Upgrade Path
+
+Users can upgrade their local model from within IntentOS settings at any time. IntentOS never forces a model change — the user decides when they want more capability and has the hardware to support it.
+
+```
+Settings → Thinking Engine → Local Model
+
+● Phi-3 Mini (3.8B)     ← installed by default
+                          works on any machine, 4GB RAM
+                          
+○ Mistral 7B (4-bit)    ← install
+                          better reasoning, needs 8GB RAM
+                          
+○ Qwen2.5 3B            ← install
+                          better multilingual support, 4GB RAM
+                          
+○ Custom model           ← add via Ollama model name
+                          for power users
+```
+
+Installing a new model is one click. IntentOS calls Ollama, pulls the model in the background, and switches to it when ready. The previous model stays installed until the user removes it.
+
+### Cloud-Only Mode
+
+For users who don't want a local model — low storage devices, users who prefer cloud performance, or enterprise deployments — IntentOS operates entirely via a connected API with no local model required.
+
+In cloud-only mode, Ollama is not installed. The Inference Router sends all tasks to the configured cloud API. The user provides their own API key during setup. IntentOS never stores or transmits this key except to make authorised inference calls.
+
+Supported cloud backends: Anthropic Claude, OpenAI GPT-4o, Google Gemini, any OpenAI-compatible endpoint.
+
+### Storage Footprint Summary
+
+| Component | Size | When |
+|---|---|---|
+| IntentOS core | ~50MB | At install |
+| Ollama engine | ~100MB | At first launch (local mode only) |
+| Phi-3 Mini (default) | ~2.3GB | At first task (local mode only) |
+| Mistral 7B 4-bit | ~4GB | Optional, user-initiated |
+| Qwen2.5 3B | ~2GB | Optional, user-initiated |
+
+A fully set up local-first IntentOS install uses approximately **2.5GB** of storage. A cloud-only install uses approximately **150MB**.
+
+---
+
 ## Design Principles for Contributors
 
 **1. Every layer is replaceable.** The Intent Kernel could run on a different LLM. The Task Interface could be a voice input. The Scheduler could be Kubernetes. Design for replaceability.
