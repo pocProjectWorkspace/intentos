@@ -754,9 +754,7 @@ def main() -> None:
             print("  Welcome to IntentOS")
             print("  Your computer, finally on your side.")
             print("=" * 56 + "\n")
-            result = wizard.run(skip_prompts=False)
-            if result.is_complete:
-                print(wizard.get_welcome_message(result))
+            wizard.run(skip_prompts=False)
     except Exception as e:
         print(f"  Setup note: {e}")
         print("  Continuing with defaults...\n")
