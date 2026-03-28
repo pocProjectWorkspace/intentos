@@ -16,8 +16,11 @@ import base64
 import hashlib
 import hmac
 import os
-import platform
 import stat
+import importlib
+
+# Use importlib to get stdlib platform (avoid collision with core.platform package)
+_platform = importlib.import_module("platform")
 from pathlib import Path
 from typing import Optional
 
@@ -46,7 +49,7 @@ class KeychainManager:
         fallback_path: Optional[Path] = None,
     ):
         self.service_name = service_name
-        self.platform = platform.system().lower()
+        self.platform = _platform.system().lower()
         self._use_os_keychain = use_os_keychain and self._os_keychain_available()
         self._fallback_path = fallback_path or self._default_fallback_path()
 
@@ -167,7 +170,7 @@ class KeychainManager:
         self._fallback_path.write_bytes(payload)
 
         # Set restrictive permissions (owner-only read/write)
-        if platform.system() != "Windows":
+        if _platform.system() != "Windows":
             self._fallback_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0o600
 
     def _retrieve_fallback(self) -> Optional[bytes]:

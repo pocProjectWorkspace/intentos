@@ -22,9 +22,12 @@ Route table:
 
 from __future__ import annotations
 
+import importlib
 import json
-import platform
 import re
+
+# Use importlib to get stdlib platform (avoid collision with core.platform package)
+platform = importlib.import_module("platform")
 import threading
 import time
 import uuid
