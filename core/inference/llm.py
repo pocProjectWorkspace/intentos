@@ -12,6 +12,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from core.inference.hardware import HardwareDetector, HardwareProfile, ModelRecommendation
+from core.inference.providers import (
+    AnthropicBackend,
+    OllamaBackend,
+    OpenAIBackend,
+    GeminiBackend,
+    CustomBackend,
+    LLMProvider,
+    ProviderConfig,
+    DEFAULT_MODELS,
+    create_backend,
+)
 from core.inference.router import (
     InferenceBackend,
     InferenceResult,
@@ -39,111 +50,35 @@ class LLMResponse:
 
 
 # ---------------------------------------------------------------------------
-# Backends
+# Provider config helper
 # ---------------------------------------------------------------------------
 
-class AnthropicBackend:
-    """Cloud backend wrapping the Anthropic Python SDK."""
+def get_provider_config(credential_provider: Any) -> Optional[ProviderConfig]:
+    """Build a ProviderConfig from the credential provider.
 
-    def __init__(self, api_key: str, default_model: str = "claude-sonnet-4-20250514"):
-        self._api_key = api_key
-        self._default_model = default_model
-        self._client: Any = None
+    Reads LLM_PROVIDER, LLM_API_KEY, LLM_MODEL, LLM_BASE_URL from the
+    credential store or environment.  Returns None when no provider is
+    configured.
+    """
+    provider_str = credential_provider.get("LLM_PROVIDER")
+    if not provider_str:
+        return None
 
-    def _ensure_client(self) -> Any:
-        if self._client is None:
-            try:
-                import anthropic
-                self._client = anthropic.Anthropic(api_key=self._api_key)
-            except ImportError:
-                raise RuntimeError("anthropic package not installed")
-        return self._client
+    try:
+        provider = LLMProvider(provider_str)
+    except ValueError:
+        return None
 
-    def generate(self, prompt: str, model: str | None = None) -> InferenceResult:
-        model = model or self._default_model
-        client = self._ensure_client()
-        start = time.monotonic()
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            text = response.content[0].text if response.content else ""
-            return InferenceResult(
-                text=text,
-                model=model,
-                backend="cloud",
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
-                latency_ms=elapsed_ms,
-            )
-        except Exception as exc:
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            return InferenceResult(
-                text="",
-                model=model,
-                backend="cloud",
-                input_tokens=0,
-                output_tokens=0,
-                latency_ms=elapsed_ms,
-                error=str(exc),
-            )
+    api_key = credential_provider.get("LLM_API_KEY") or ""
+    model = credential_provider.get("LLM_MODEL") or DEFAULT_MODELS.get(provider, "")
+    base_url = credential_provider.get("LLM_BASE_URL")
 
-
-class OllamaBackend:
-    """Local backend wrapping HTTP calls to Ollama."""
-
-    def __init__(self, base_url: str = "http://localhost:11434", default_model: str = "phi3:mini"):
-        self._base_url = base_url.rstrip("/")
-        self._default_model = default_model
-
-    def generate(self, prompt: str, model: str | None = None) -> InferenceResult:
-        model = model or self._default_model
-        start = time.monotonic()
-        try:
-            import urllib.request
-            import urllib.error
-
-            payload = json.dumps({
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-            }).encode()
-            req = urllib.request.Request(
-                f"{self._base_url}/api/generate",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                body = json.loads(resp.read())
-
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            text = body.get("response", "")
-            # Ollama provides eval_count / prompt_eval_count
-            input_tokens = body.get("prompt_eval_count", len(prompt) // 4)
-            output_tokens = body.get("eval_count", len(text) // 4)
-            return InferenceResult(
-                text=text,
-                model=model,
-                backend="local",
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                latency_ms=elapsed_ms,
-            )
-        except Exception as exc:
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            return InferenceResult(
-                text="",
-                model=model,
-                backend="local",
-                input_tokens=0,
-                output_tokens=0,
-                latency_ms=elapsed_ms,
-                error=str(exc),
-            )
+    return ProviderConfig(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -192,20 +127,41 @@ class LLMService:
         self._setup_backends(credential_provider)
 
     def _setup_backends(self, credential_provider: Any = None) -> None:
-        """Auto-detect and configure inference backends."""
-        # Cloud backend (Anthropic)
+        """Auto-detect and configure inference backends.
+
+        Supports multiple cloud providers via ProviderConfig.  Falls back to
+        legacy ANTHROPIC_API_KEY when no explicit provider config is found.
+        """
+        cloud_backend = None
+
+        # Try to read provider config from credential provider
         try:
             if credential_provider:
-                api_key = credential_provider.get("ANTHROPIC_API_KEY")
-            else:
-                import os
-                api_key = os.environ.get("ANTHROPIC_API_KEY")
-
-            if api_key:
-                cloud = AnthropicBackend(api_key=api_key)
-                self._router.set_cloud_backend(cloud)
+                config = get_provider_config(credential_provider)
+                if config and config.provider != LLMProvider.OLLAMA:
+                    cloud_backend = create_backend(config)
+                elif config and config.provider == LLMProvider.OLLAMA:
+                    # Provider is local-only; skip cloud, set up Ollama below
+                    pass
         except Exception:
-            pass  # No cloud backend available
+            pass
+
+        # Legacy fallback: if no cloud backend yet, try ANTHROPIC_API_KEY
+        if cloud_backend is None:
+            try:
+                if credential_provider:
+                    api_key = credential_provider.get("ANTHROPIC_API_KEY")
+                else:
+                    import os
+                    api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+                if api_key:
+                    cloud_backend = AnthropicBackend(api_key=api_key)
+            except Exception:
+                pass
+
+        if cloud_backend is not None:
+            self._router.set_cloud_backend(cloud_backend)
 
         # Local backend (Ollama — only if running)
         try:

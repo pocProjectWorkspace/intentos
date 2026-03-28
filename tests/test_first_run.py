@@ -13,6 +13,7 @@ import pytest
 
 from core.first_run import FirstRunWizard, FirstRunResult, PrivacyMode
 from core.inference.hardware import HardwareProfile, GPUInfo, ModelRecommendation
+from core.inference.providers import LLMProvider
 
 
 # ---------------------------------------------------------------------------
@@ -136,9 +137,15 @@ class TestSetupCredentials:
         """Test 8: setup_credentials skips prompt if key already exists."""
         provider = MockProvider.return_value
         provider.has.return_value = True
+        provider.get.return_value = "sk-ant-existing-key"
 
         wizard.setup_credentials(skip_prompts=False)
-        provider.store.assert_not_called()
+        # Should store provider config but not prompt for a new key
+        # (getpass should not be called)
+        store_calls = provider.store.call_args_list
+        key_names = [c[0][0] for c in store_calls]
+        assert "LLM_PROVIDER" in key_names
+        assert "LLM_MODEL" in key_names
 
     @patch("core.first_run.CredentialProvider")
     @patch("getpass.getpass", return_value="sk-ant-fake-key-456")
@@ -148,7 +155,10 @@ class TestSetupCredentials:
         provider.has.return_value = False
 
         wizard.setup_credentials(skip_prompts=False)
-        provider.store.assert_called_once_with("ANTHROPIC_API_KEY", "sk-ant-fake-key-456")
+        store_calls = provider.store.call_args_list
+        stored = {c[0][0]: c[0][1] for c in store_calls}
+        assert stored["LLM_API_KEY"] == "sk-ant-fake-key-456"
+        assert stored["ANTHROPIC_API_KEY"] == "sk-ant-fake-key-456"
 
 
 # ---------------------------------------------------------------------------
@@ -350,3 +360,50 @@ class TestSkipMode:
         assert result.is_complete is True
         assert result.privacy_mode == PrivacyMode.SMART_ROUTING  # default
         assert result.model_recommendation == "llama3.1:8b"
+
+
+# ---------------------------------------------------------------------------
+# 23-28  Provider Selection
+# ---------------------------------------------------------------------------
+
+class TestSelectProvider:
+    @patch("builtins.input", return_value="1")
+    def test_input_1_returns_anthropic(self, mock_input, wizard):
+        """Test 23: Input '1' selects ANTHROPIC."""
+        provider = wizard.select_provider(skip_prompts=False)
+        assert provider == LLMProvider.ANTHROPIC
+
+    @patch("builtins.input", return_value="2")
+    def test_input_2_returns_openai(self, mock_input, wizard):
+        """Test 24: Input '2' selects OPENAI."""
+        provider = wizard.select_provider(skip_prompts=False)
+        assert provider == LLMProvider.OPENAI
+
+    @patch("builtins.input", return_value="3")
+    def test_input_3_returns_gemini(self, mock_input, wizard):
+        """Test 25: Input '3' selects GEMINI."""
+        provider = wizard.select_provider(skip_prompts=False)
+        assert provider == LLMProvider.GEMINI
+
+    @patch("builtins.input", return_value="4")
+    def test_input_4_returns_custom(self, mock_input, wizard):
+        """Test 26: Input '4' selects CUSTOM."""
+        provider = wizard.select_provider(skip_prompts=False)
+        assert provider == LLMProvider.CUSTOM
+
+    @patch("builtins.input", return_value="5")
+    def test_input_5_returns_ollama(self, mock_input, wizard):
+        """Test 27: Input '5' selects OLLAMA."""
+        provider = wizard.select_provider(skip_prompts=False)
+        assert provider == LLMProvider.OLLAMA
+
+    @patch("builtins.input", return_value="banana")
+    def test_invalid_defaults_to_anthropic(self, mock_input, wizard):
+        """Test 28: Invalid input defaults to ANTHROPIC."""
+        provider = wizard.select_provider(skip_prompts=False)
+        assert provider == LLMProvider.ANTHROPIC
+
+    def test_skip_prompts_returns_anthropic(self, wizard):
+        """Test 29: skip_prompts=True returns ANTHROPIC."""
+        provider = wizard.select_provider(skip_prompts=True)
+        assert provider == LLMProvider.ANTHROPIC

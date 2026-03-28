@@ -154,6 +154,7 @@ class APIBridge:
             ("GET",    r"/api/credentials$",         self.handle_list_credentials),
             ("POST",   r"/api/credentials$",         self.handle_store_credential),
             ("DELETE", r"/api/credentials/(?P<name>[^/]+)$", self.handle_delete_credential),
+            ("POST",   r"/api/voice/listen$",            self.handle_voice_listen),
         ]
 
     def _match_route(self, method: str, path: str) -> Optional[Tuple[Callable, dict]]:
@@ -468,6 +469,40 @@ class APIBridge:
             self._credentials.pop(name, None)
 
         return 200, {"status": "deleted", "name": name}
+
+    # -- Voice endpoints ----------------------------------------------------
+
+    def handle_voice_listen(self, req: dict) -> Tuple[int, dict]:
+        """POST /api/voice/listen — record from microphone and transcribe."""
+        try:
+            from core.voice.stt import VoiceInput
+        except ImportError:
+            return 500, {"error": "Voice module not available"}
+
+        body = req.get("body", {})
+        duration = body.get("duration", 5)
+
+        vi = VoiceInput()
+        if not vi.is_available():
+            return 503, {
+                "error": "Voice input not available. Install: pip install SpeechRecognition pyaudio",
+            }
+
+        result = vi.listen_and_transcribe(duration=duration)
+        if result and result.text:
+            return 200, {
+                "text": result.text,
+                "confidence": result.confidence,
+                "provider": result.provider,
+                "duration_seconds": result.duration_seconds,
+                "language": result.language,
+            }
+
+        return 200, {
+            "text": None,
+            "confidence": 0.0,
+            "error": "Could not understand audio",
+        }
 
 
 # ---------------------------------------------------------------------------

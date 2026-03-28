@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.inference.hardware import HardwareDetector, HardwareProfile, ModelRecommendation
+from core.inference.providers import LLMProvider, DEFAULT_MODELS
 from core.security.credential_provider import CredentialProvider
 
 
@@ -44,6 +45,7 @@ class FirstRunResult:
     model_recommendation: str = ""
     workspace_path: str = ""
     is_complete: bool = False
+    llm_provider: Optional[LLMProvider] = None
 
 
 # ---------------------------------------------------------------------------
@@ -94,10 +96,48 @@ class FirstRunWizard:
         return rec.model_name
 
     # ------------------------------------------------------------------
+    # Provider selection
+    # ------------------------------------------------------------------
+
+    _PROVIDER_HELP_URLS = {
+        LLMProvider.ANTHROPIC: "https://console.anthropic.com/settings/keys",
+        LLMProvider.OPENAI: "https://platform.openai.com/api-keys",
+        LLMProvider.GEMINI: "https://aistudio.google.com/app/apikey",
+    }
+
+    def select_provider(self, skip_prompts: bool = False) -> LLMProvider:
+        """Prompt the user to choose an AI provider."""
+        if skip_prompts:
+            return LLMProvider.ANTHROPIC
+
+        print("\n  Which AI provider would you like to use?\n")
+        print("    [1] Anthropic (Claude)     -- Recommended")
+        print("    [2] OpenAI (GPT)")
+        print("    [3] Google (Gemini)")
+        print("    [4] Custom endpoint         -- Any OpenAI-compatible API")
+        print("    [5] None (local only)       -- Requires Ollama installed")
+        print()
+
+        choice = input("  Choose [1-5] (default: 1): ").strip()
+
+        mapping = {
+            "1": LLMProvider.ANTHROPIC,
+            "2": LLMProvider.OPENAI,
+            "3": LLMProvider.GEMINI,
+            "4": LLMProvider.CUSTOM,
+            "5": LLMProvider.OLLAMA,
+        }
+        return mapping.get(choice, LLMProvider.ANTHROPIC)
+
+    # ------------------------------------------------------------------
     # Credentials
     # ------------------------------------------------------------------
 
-    def setup_credentials(self, skip_prompts: bool = False) -> bool:
+    def setup_credentials(
+        self,
+        skip_prompts: bool = False,
+        llm_provider: Optional[LLMProvider] = None,
+    ) -> bool:
         """Ensure an API key is available; prompt if needed.
 
         Returns True if a key is now available.
@@ -107,18 +147,47 @@ class FirstRunWizard:
             keychain_fallback_path=self.base_path / "master_key.enc",
         )
 
-        if provider.has("ANTHROPIC_API_KEY"):
+        chosen = llm_provider or LLMProvider.ANTHROPIC
+
+        # Store provider choice
+        provider.store("LLM_PROVIDER", chosen.value)
+        provider.store("LLM_MODEL", DEFAULT_MODELS.get(chosen, ""))
+
+        # Ollama needs no API key
+        if chosen == LLMProvider.OLLAMA:
+            return True
+
+        # Check legacy key for backwards compat
+        if chosen == LLMProvider.ANTHROPIC and provider.has("ANTHROPIC_API_KEY"):
+            provider.store("LLM_API_KEY", provider.get("ANTHROPIC_API_KEY"))
+            return True
+
+        # Already have a key stored
+        if provider.has("LLM_API_KEY"):
             return True
 
         if skip_prompts:
             return False
 
-        print("\n  IntentOS needs your Anthropic API key.")
-        print("  Get one at: https://console.anthropic.com/settings/keys\n")
+        help_url = self._PROVIDER_HELP_URLS.get(chosen, "")
+        display = chosen.value.capitalize()
 
+        print(f"\n  IntentOS needs your {display} API key.")
+        if help_url:
+            print(f"  Get one at: {help_url}")
+
+        if chosen == LLMProvider.CUSTOM:
+            base_url = input("\n  Enter the endpoint URL: ").strip()
+            if base_url:
+                provider.store("LLM_BASE_URL", base_url)
+
+        print()
         key = getpass.getpass("  Paste your API key: ").strip()
         if key:
-            provider.store("ANTHROPIC_API_KEY", key)
+            provider.store("LLM_API_KEY", key)
+            # Also store as legacy key for Anthropic
+            if chosen == LLMProvider.ANTHROPIC:
+                provider.store("ANTHROPIC_API_KEY", key)
             print("  Stored securely.\n")
             return True
 
@@ -180,13 +249,16 @@ class FirstRunWizard:
         profile = self.detect_hardware()
         model_name = self.recommend_model(profile)
 
-        # 3. Credentials
-        self.setup_credentials(skip_prompts=skip_prompts)
-
-        # 4. Privacy mode
+        # 3. Privacy mode
         privacy = self.select_privacy_mode(skip_prompts=skip_prompts)
 
-        # 5. Grants
+        # 4. Provider selection
+        chosen_provider = self.select_provider(skip_prompts=skip_prompts)
+
+        # 5. Credentials (with provider context)
+        self.setup_credentials(skip_prompts=skip_prompts, llm_provider=chosen_provider)
+
+        # 6. Grants
         self.setup_grants()
 
         # Build result
@@ -196,6 +268,7 @@ class FirstRunWizard:
             model_recommendation=model_name,
             workspace_path=str(self.base_path),
             is_complete=True,
+            llm_provider=chosen_provider,
         )
 
         # Persist settings
@@ -204,6 +277,7 @@ class FirstRunWizard:
             "model": model_name,
             "workspace": str(self.base_path),
             "hardware": profile.to_dict() if profile else None,
+            "llm_provider": chosen_provider.value,
         }
         (self.base_path / "settings.json").write_text(json.dumps(settings, indent=2))
 

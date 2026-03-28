@@ -130,6 +130,50 @@ class CredentialProvider:
         return value
 
 
+def get_provider_config(provider: Optional[CredentialProvider] = None):
+    """
+    Build a ProviderConfig from the credential store.
+
+    Returns a ProviderConfig if LLM_PROVIDER is set, otherwise falls back
+    to Anthropic if ANTHROPIC_API_KEY exists.  Returns None if nothing is
+    configured.
+    """
+    from core.inference.providers import LLMProvider, ProviderConfig, DEFAULT_MODELS
+
+    if provider is None:
+        provider = CredentialProvider()
+
+    # New-style: explicit provider selection
+    provider_str = provider.get("LLM_PROVIDER")
+    if provider_str:
+        try:
+            llm_provider = LLMProvider(provider_str)
+        except ValueError:
+            llm_provider = LLMProvider.ANTHROPIC
+
+        api_key = provider.get("LLM_API_KEY") or ""
+        model = provider.get("LLM_MODEL") or DEFAULT_MODELS.get(llm_provider, "")
+        base_url = provider.get("LLM_BASE_URL")
+
+        return ProviderConfig(
+            provider=llm_provider,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+        )
+
+    # Legacy fallback: ANTHROPIC_API_KEY
+    api_key = provider.get("ANTHROPIC_API_KEY")
+    if api_key:
+        return ProviderConfig(
+            provider=LLMProvider.ANTHROPIC,
+            api_key=api_key,
+            model=DEFAULT_MODELS[LLMProvider.ANTHROPIC],
+        )
+
+    return None
+
+
 def get_api_key(provider: Optional[CredentialProvider] = None) -> str:
     """
     Get the Anthropic API key — the primary credential for IntentOS Phase 1.

@@ -1,0 +1,2 @@
+[console_scripts]
+intentos = core.kernel_v2:main

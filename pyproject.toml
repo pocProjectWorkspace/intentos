@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intentos"
+version = "2.0.0"
+description = "IntentOS — Language is the Interface. AI execution layer where files never leave your device."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "IntentOS Team"}
+]
+keywords = ["ai", "llm", "agent", "privacy", "local-first", "enterprise"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "anthropic>=0.39.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "python-docx>=1.1.0",
+    "pypdf>=4.0.0",
+    "cryptography>=42.0.0",
+    "keyring>=25.0.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0.0"]
+gemini = ["google-generativeai>=0.3.0"]
+voice = ["SpeechRecognition>=3.10.0"]
+all = ["openai>=1.0.0", "google-generativeai>=0.3.0", "SpeechRecognition>=3.10.0"]
+dev = ["pytest>=8.0.0", "ruff>=0.3.0"]
+
+[project.scripts]
+intentos = "core.kernel_v2:main"
+
+[tool.setuptools.packages.find]
+include = ["core*", "capabilities*"]
+
+[project.urls]
+Homepage = "https://github.com/pocProjectWorkspace/intentos"
+Repository = "https://github.com/pocProjectWorkspace/intentos"

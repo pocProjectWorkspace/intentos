@@ -799,9 +799,46 @@ def main() -> None:
 
         # Handle CLI subcommands
         if user_input.startswith("!"):
-            output = kernel.handle_command(user_input[1:].strip())
-            print(output)
-            continue
+            cmd_text = user_input[1:].strip().lower()
+
+            # Voice input
+            if cmd_text in ("voice", "v"):
+                try:
+                    from core.voice.stt import VoiceInput
+                    vi = VoiceInput()
+                    if vi.is_available():
+                        print("  Listening... (speak now, 5 seconds)")
+                        result = vi.listen_and_transcribe(duration=5)
+                        if result and result.text:
+                            print(f'  Heard: "{result.text}"')
+                            user_input = result.text
+                            # Fall through to process_task below
+                        else:
+                            print("  Couldn't understand that. Try again or type your task.")
+                            continue
+                    else:
+                        print("  Voice input not available. Install: pip install SpeechRecognition pyaudio")
+                        continue
+                except Exception as e:
+                    print(f"  Voice error: {e}")
+                    continue
+            elif cmd_text == "help":
+                print(
+                    "Commands:\n"
+                    "  !help         Show this help\n"
+                    "  !voice / !v   Voice input (speak a task)\n"
+                    "  !status       System status\n"
+                    "  !cost         Cost breakdown\n"
+                    "  !history      Task history\n"
+                    "  !credentials  Credential info\n"
+                    "  !security     Security stats\n"
+                    "  exit          Quit"
+                )
+                continue
+            else:
+                output = kernel.handle_command(cmd_text)
+                print(output)
+                continue
 
         result = kernel.process_task(user_input)
         kernel.display_result(result)
