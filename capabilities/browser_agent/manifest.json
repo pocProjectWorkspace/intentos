@@ -1,0 +1,31 @@
+{
+  "name": "browser_agent",
+  "version": "0.1.0",
+  "description": "Web search and data extraction for IntentOS",
+  "author": "intentos-core",
+  "license": "MIT",
+  "category": "browser",
+  "status": "draft",
+
+  "permissions": [
+    "network"
+  ],
+
+  "optional_permissions": [],
+
+  "actions": [
+    "search_web",
+    "fetch_page",
+    "extract_data"
+  ],
+
+  "platforms": ["linux", "macos", "windows"],
+
+  "dependencies": {
+    "ollama_models": [],
+    "system_binaries": [],
+    "python_packages": "see requirements.txt"
+  },
+
+  "min_intentos_version": "0.1.0"
+}

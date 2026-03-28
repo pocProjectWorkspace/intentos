@@ -1,0 +1,34 @@
+{
+  "name": "document_agent",
+  "version": "0.1.0",
+  "description": "Create, read, append, and convert documents for IntentOS",
+  "author": "intentos-core",
+  "license": "MIT",
+  "category": "document",
+  "status": "draft",
+
+  "permissions": [
+    "filesystem.read",
+    "filesystem.write"
+  ],
+
+  "optional_permissions": [],
+
+  "actions": [
+    "create_document",
+    "append_content",
+    "read_document",
+    "convert_document",
+    "save_document"
+  ],
+
+  "platforms": ["linux", "macos", "windows"],
+
+  "dependencies": {
+    "ollama_models": [],
+    "system_binaries": [],
+    "python_packages": "see requirements.txt"
+  },
+
+  "min_intentos_version": "0.1.0"
+}
