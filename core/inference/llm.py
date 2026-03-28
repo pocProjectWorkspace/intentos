@@ -180,10 +180,6 @@ class LLMService:
         strict = budget is not None
         self._cost_manager = CostManager(budget=budget, strict=strict)
 
-        # Backends (will be set up externally or via _setup_backends)
-        self._local_backend: Optional[InferenceBackend] = None
-        self._cloud_backend: Optional[InferenceBackend] = None
-
         # Statistics
         self._calls_local = 0
         self._calls_cloud = 0
@@ -191,6 +187,34 @@ class LLMService:
 
         # Store privacy mode for config
         self._privacy_mode = privacy_mode
+
+        # Auto-setup backends
+        self._setup_backends(credential_provider)
+
+    def _setup_backends(self, credential_provider: Any = None) -> None:
+        """Auto-detect and configure inference backends."""
+        # Cloud backend (Anthropic)
+        try:
+            if credential_provider:
+                api_key = credential_provider.get("ANTHROPIC_API_KEY")
+            else:
+                import os
+                api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+            if api_key:
+                cloud = AnthropicBackend(api_key=api_key)
+                self._router.set_cloud_backend(cloud)
+        except Exception:
+            pass  # No cloud backend available
+
+        # Local backend (Ollama — only if running)
+        try:
+            import urllib.request
+            urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
+            local = OllamaBackend(default_model=self._model_rec.model_name)
+            self._router.set_local_backend(local)
+        except Exception:
+            pass  # Ollama not running
 
     # -- Hardware info ------------------------------------------------------
 

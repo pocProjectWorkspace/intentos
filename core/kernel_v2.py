@@ -233,7 +233,11 @@ class IntentKernel:
         self.credentials = CredentialProvider()
 
         # Inference
-        self.llm = LLMService(privacy_mode=privacy_mode, budget=budget)
+        self.llm = LLMService(
+            privacy_mode=privacy_mode,
+            credential_provider=self.credentials,
+            budget=budget,
+        )
 
         # Orchestration
         self.scheduler = AgentScheduler(workspace=self._workspace)
