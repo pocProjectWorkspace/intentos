@@ -5,7 +5,7 @@ import os
 import pytest
 from pathlib import Path
 
-from core.platform.offline import (
+from core.hub.offline import (
     ContentItem,
     OfflineKit,
     OfflinePackageManager,

@@ -11,7 +11,7 @@ import shutil
 
 import pytest
 
-from core.platform.bundles import (
+from core.hub.bundles import (
     BundleTier,
     TierSpec,
     KnowledgeSource,

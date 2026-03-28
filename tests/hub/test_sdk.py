@@ -10,7 +10,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from core.platform.sdk import (
+from core.hub.sdk import (
     ContributorSDK,
     ValidationResult,
     TestResult,

@@ -2,7 +2,7 @@
 
 import pytest
 
-from core.platform.ui_reasoning import (
+from core.hub.ui_reasoning import (
     ColorPalette,
     DesignSystem,
     FontPairing,

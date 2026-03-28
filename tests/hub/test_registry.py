@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from core.platform.registry import (
+from core.hub.registry import (
     CapabilityManifest,
     Registry,
     RegistryEntry,

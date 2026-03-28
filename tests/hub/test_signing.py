@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from core.platform.signing import (
+from core.hub.signing import (
     KeyPair,
     Signature,
     SigningManager,

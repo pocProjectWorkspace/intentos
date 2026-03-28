@@ -6,12 +6,9 @@ for running via Ollama. Inspired by Project NOMAD's hardware auto-detection.
 
 from __future__ import annotations
 
-import importlib
 import os
+import platform
 import subprocess
-
-# Use importlib to get stdlib platform (avoid collision with core.platform package)
-platform = importlib.import_module("platform")
 from dataclasses import asdict, dataclass
 from typing import Dict, Optional
 

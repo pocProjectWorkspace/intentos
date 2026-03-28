@@ -743,17 +743,39 @@ def _make_agent_handler(agent_name: str, module_path: str):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    first_run = _ensure_workspace()
-    if first_run:
-        home = os.path.expanduser("~")
-        print(f"\n  Workspace created at {home}/.intentos/\n")
+    _ensure_workspace()
+
+    # First-run wizard
+    try:
+        from core.first_run import FirstRunWizard
+        wizard = FirstRunWizard()
+        if wizard.is_first_run():
+            print("\n" + "=" * 56)
+            print("  Welcome to IntentOS")
+            print("  Your computer, finally on your side.")
+            print("=" * 56 + "\n")
+            result = wizard.run(skip_prompts=False)
+            if result.is_complete:
+                print(wizard.get_welcome_message(result))
+    except Exception as e:
+        print(f"  Setup note: {e}")
+        print("  Continuing with defaults...\n")
 
     kernel = IntentKernel()
 
+    # Start API bridge in background
+    try:
+        from core.api.server import APIBridge
+        api = APIBridge(kernel=kernel)
+        api.start(port=7891)
+        api_status = "API bridge on :7891"
+    except Exception:
+        api_status = "API bridge offline"
+
     config = kernel.llm.get_config()
     print(f"IntentOS Kernel v{IntentKernel.VERSION}")
-    print(f"Model: {config.get('local_model', 'N/A')} | Mode: {config.get('privacy_mode', 'N/A')}")
-    print("Type a task in natural language. Type 'exit' to stop.\n")
+    print(f"Model: {config.get('local_model', 'N/A')} | Mode: {config.get('privacy_mode', 'N/A')} | {api_status}")
+    print("Type a task in natural language. Type '!help' for commands. Type 'exit' to stop.\n")
 
     while True:
         try:
