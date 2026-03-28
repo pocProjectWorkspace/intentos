@@ -754,10 +754,18 @@ def main() -> None:
         from core.first_run import FirstRunWizard
         wizard = FirstRunWizard()
         if wizard.is_first_run():
-            print("\n" + "=" * 56)
-            print("  Welcome to IntentOS")
-            print("  Your computer, finally on your side.")
-            print("=" * 56 + "\n")
+            print()
+            print("  \033[38;2;37;99;235m      /\\_____/\\")
+            print("     /  o   o  \\")
+            print("    ( ==  ^  == )")
+            print("     )         (")
+            print("    (           )")
+            print("   ( (  )   (  ) )")
+            print("  (__(__)___(__)__)\033[0m")
+            print()
+            print("  \033[1mWelcome to IntentOS\033[0m")
+            print("  \033[38;2;107;114;128mYour computer, finally on your side.\033[0m")
+            print()
             wizard.run(skip_prompts=False)
     except Exception as e:
         print(f"  Setup note: {e}")
@@ -775,9 +783,25 @@ def main() -> None:
         api_status = "API bridge offline"
 
     config = kernel.llm.get_config()
-    print(f"IntentOS Kernel v{IntentKernel.VERSION}")
-    print(f"Model: {config.get('local_model', 'N/A')} | Mode: {config.get('privacy_mode', 'N/A')} | {api_status}")
-    print("Type a task in natural language. Type '!help' for commands. Type 'exit' to stop.\n")
+    model = config.get('local_model', 'N/A')
+    mode = config.get('privacy_mode', 'N/A')
+
+    # The Lynx
+    print()
+    print("  \033[38;2;37;99;235m      /\\_____/\\")
+    print("     /  o   o  \\")
+    print("    ( ==  ^  == )")
+    print("     )         (")
+    print("    (           )")
+    print("   ( (  )   (  ) )")
+    print("  (__(__)___(__)__)\033[0m")
+    print()
+    print(f"  \033[1mIntentOS\033[0m v{IntentKernel.VERSION}")
+    print(f"  \033[38;2;107;114;128mLanguage is the interface. The file never leaves.\033[0m")
+    print()
+    print(f"  Model: {model} | Mode: {mode} | {api_status}")
+    print("  Type a task, or '!help' for commands. 'exit' to stop.")
+    print()
 
     while True:
         try:
