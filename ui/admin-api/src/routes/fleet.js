@@ -1,8 +1,9 @@
 const { Router } = require('express');
+const { fetchBridge } = require('../bridge-client');
 
 const router = Router();
 
-// In-memory seed data
+// In-memory seed data (fallback when bridge is unavailable)
 const devices = [
   { id: 'd-001', hostname: 'workstation-1', os: 'macOS 15.3', hardware: { cpu: 'M4 Pro', ram_gb: 32, gpu: 'Apple M4 Pro' }, status: 'online', model: 'llama-3.1-70b' },
   { id: 'd-002', hostname: 'workstation-2', os: 'Ubuntu 24.04', hardware: { cpu: 'Ryzen 9 7950X', ram_gb: 64, gpu: 'RTX 4090' }, status: 'online', model: 'mistral-7b' },
@@ -15,19 +16,25 @@ const updates = [
   { id: 'upd-002', version: '0.2.1', release_date: '2026-03-27', changelog: 'Security patch for policy engine', applicable_devices: ['d-001', 'd-002', 'd-003', 'd-004'] },
 ];
 
-// Fleet overview
-router.get('/api/fleet/status', (req, res) => {
-  const activeDevices = devices.filter((d) => d.status === 'online').length;
-  const modelDist = {};
-  for (const d of devices) {
-    modelDist[d.model] = (modelDist[d.model] || 0) + 1;
-  }
+// Fleet overview — tries Python bridge first, falls back to in-memory
+router.get('/api/fleet/status', async (req, res) => {
+  try {
+    const realData = await fetchBridge('/bridge/fleet/status');
+    return res.json(realData);
+  } catch {
+    // Bridge unavailable — use in-memory fallback
+    const activeDevices = devices.filter((d) => d.status === 'online').length;
+    const modelDist = {};
+    for (const d of devices) {
+      modelDist[d.model] = (modelDist[d.model] || 0) + 1;
+    }
 
-  res.json({
-    active_devices: activeDevices,
-    total_devices: devices.length,
-    model_distribution: modelDist,
-  });
+    res.json({
+      active_devices: activeDevices,
+      total_devices: devices.length,
+      model_distribution: modelDist,
+    });
+  }
 });
 
 // List all devices

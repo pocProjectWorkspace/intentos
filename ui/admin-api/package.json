@@ -4,6 +4,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node src/server.js",
+    "start:bridge": "python bridge.py & node src/server.js",
+    "bridge": "python bridge.py",
     "test": "jest --verbose"
   },
   "keywords": [],

@@ -1,4 +1,5 @@
 const { Router } = require('express');
+const { fetchBridge } = require('../bridge-client');
 
 const router = Router();
 
@@ -6,9 +7,17 @@ const router = Router();
 const users = [];
 let nextId = 1;
 
-// List all users
-router.get('/api/users', (req, res) => {
-  res.json(users);
+// List all users — tries Python bridge first for real auth users
+router.get('/api/users', async (req, res) => {
+  try {
+    const bridgeUsers = await fetchBridge('/bridge/users');
+    // Merge bridge users with any locally-created users
+    const merged = [...bridgeUsers, ...users];
+    return res.json(merged);
+  } catch {
+    // Bridge unavailable — use in-memory fallback
+    res.json(users);
+  }
 });
 
 // Get user by id

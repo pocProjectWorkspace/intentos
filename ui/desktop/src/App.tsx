@@ -58,7 +58,6 @@ function App() {
 
       <StatusBar
         settings={settings}
-        connected={true}
         tokensUsed={0}
         tokenBudget={100000}
       />

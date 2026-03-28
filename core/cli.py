@@ -26,6 +26,7 @@ class CLICommands:
             "security": self.cmd_security,
             "help": self.cmd_help,
             "hardware": self.cmd_hardware,
+            "audit": self.cmd_audit,
         }
 
     def handle(self, command_str: str) -> str:
@@ -133,6 +134,7 @@ class CLICommands:
             "security": "Show security pipeline stats",
             "help": "Show this help message",
             "hardware": "Show hardware detection results",
+            "audit": "Show audit log (--agent, --status, summary)",
         }
         for cmd, desc in descriptions.items():
             lines.append(f"  !{cmd:15s} {desc}")
@@ -168,6 +170,55 @@ class CLICommands:
             lines.append(f"Detection error: {exc}")
 
         return "\n".join(lines)
+
+    def cmd_audit(self, args: List[str]) -> str:
+        """Show audit log entries with optional filters.
+
+        Usage:
+            !audit              — last 10 entries
+            !audit 20           — last 20 entries
+            !audit --agent X    — filter by agent name
+            !audit --status X   — filter by result status
+            !audit summary      — show summary statistics
+        """
+        from core.audit import AuditViewer
+
+        log_path = AuditViewer._default_log_path()
+
+        # Parse args
+        limit = 10
+        agent_filter = None
+        status_filter = None
+        show_summary = False
+
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "summary":
+                show_summary = True
+            elif arg == "--agent" and i + 1 < len(args):
+                i += 1
+                agent_filter = args[i]
+            elif arg == "--status" and i + 1 < len(args):
+                i += 1
+                status_filter = args[i]
+            elif arg.isdigit():
+                limit = int(arg)
+            i += 1
+
+        entries = AuditViewer.read_logs(log_path)
+
+        if agent_filter:
+            entries = AuditViewer.filter_by_agent(entries, agent_filter)
+        if status_filter:
+            entries = AuditViewer.filter_by_status(entries, status_filter)
+
+        if show_summary:
+            return AuditViewer.format_summary(entries)
+
+        # Show last N entries
+        entries = entries[-limit:]
+        return AuditViewer.format_entries(entries, limit=limit)
 
     def cmd_unknown(self, args: List[str]) -> str:
         """Unknown command message."""
