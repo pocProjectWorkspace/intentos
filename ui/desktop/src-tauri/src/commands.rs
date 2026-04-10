@@ -3,6 +3,7 @@
 //! These are exposed to the React frontend via `invoke()`.
 
 use crate::{ollama, sidecar};
+use tauri::Emitter;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]

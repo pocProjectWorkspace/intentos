@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use tauri::Emitter;
 
 const OLLAMA_API: &str = "http://localhost:11434";
 

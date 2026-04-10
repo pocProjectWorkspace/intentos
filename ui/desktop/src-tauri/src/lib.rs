@@ -2,7 +2,7 @@ mod commands;
 mod ollama;
 mod sidecar;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 pub fn run() {
     tauri::Builder::default()

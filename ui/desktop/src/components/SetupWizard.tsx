@@ -71,6 +71,15 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
           }
         }
       } catch {
+        // Tauri IPC failed — try direct HTTP health check as fallback
+        try {
+          const res = await fetch('http://127.0.0.1:7891/api/health');
+          if (res.ok && !cancelled) {
+            onComplete();
+            return;
+          }
+        } catch { /* backend not ready */ }
+
         if (!cancelled) {
           // Backend not ready yet — wait and retry
           setTimeout(checkStatus, 2000);

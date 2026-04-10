@@ -5,9 +5,7 @@ import { TaskHistory } from './components/TaskHistory';
 import { ResultPane } from './components/ResultPane';
 import { Settings } from './components/Settings';
 import { StatusBar } from './components/StatusBar';
-import { SetupWizard } from './components/SetupWizard';
 import { useIntentOS } from './hooks/useIntentOS';
-import { isTauri } from './lib/platform';
 import './App.css';
 
 function App() {
@@ -18,11 +16,6 @@ function App() {
     loadSession, newSession, deleteSession,
   } = useIntentOS();
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [setupComplete, setSetupComplete] = useState(!isTauri());
-
-  if (!setupComplete) {
-    return <SetupWizard onComplete={() => setSetupComplete(true)} />;
-  }
 
   // Get the latest task (for suggestions display)
   const latestTask = tasks[0] ?? null;
