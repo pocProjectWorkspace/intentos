@@ -704,7 +704,7 @@ footer a { color: var(--text-secondary); }
     <div class="hero__content">
       <div class="hero__badge">
         <span class="nav-logo__dot"></span>
-        v2.0 — Now with local voice AI
+        v0.1.0 — Now available for download
       </div>
       <h1 class="hero__title">
         Your Computer,<br/>
@@ -789,7 +789,7 @@ footer a { color: var(--text-secondary); }
       <div class="glass-card reveal">
         <div class="glass-card__icon glass-card__icon--blue">&#127908;</div>
         <div class="glass-card__title">Voice Interface</div>
-        <div class="glass-card__text">Speak your tasks. Powered by Voxtral — a 3GB voice model that runs on your device with studio-quality output.</div>
+        <div class="glass-card__text">Speak your tasks. Powered by Whisper and Piper TTS — voice models that run on your device with studio-quality output.</div>
       </div>
       <div class="glass-card reveal">
         <div class="glass-card__icon glass-card__icon--pink">&#128200;</div>
@@ -940,9 +940,9 @@ footer a { color: var(--text-secondary); }
       <div class="glass-card download-card reveal" id="dl-mac">
         <div class="download-card__icon">&#63743;</div>
         <div class="download-card__platform">macOS</div>
-        <div class="download-card__size">Apple Silicon &amp; Intel &middot; macOS 12+</div>
+        <div class="download-card__size">Apple Silicon &amp; Intel &middot; macOS 12+ &middot; 169 MB</div>
         <button class="download-card__btn" onclick="downloadMac()">
-          &#8595; &nbsp;Download .pkg
+          &#8595; &nbsp;Download .dmg
         </button>
       </div>
       <div class="glass-card download-card reveal" id="dl-win">
@@ -954,9 +954,12 @@ footer a { color: var(--text-secondary); }
         </button>
       </div>
     </div>
+    <div class="download-cli reveal" style="margin-top: 32px;">
+      <span style="font-size: 14px; color: var(--text-secondary);">8 GB RAM minimum &middot; 16 GB recommended for local AI &middot; Free forever for personal use</span>
+    </div>
     <div class="download-cli reveal">
       Prefer the command line?<br/>
-      <code>curl -fsSL https://intentos.dev/install.sh | sh</code>
+      <code>git clone https://github.com/pocProjectWorkspace/intentos &amp;&amp; bash intentos/setup.sh</code>
     </div>
   </div>
 </section>
@@ -964,7 +967,7 @@ footer a { color: var(--text-secondary); }
 <!-- Footer -->
 <footer>
   <div class="container">
-    <p>IntentOS &copy; 2026 &middot; <a href="https://github.com/pocProjectWorkspace/intentos">GitHub</a> &middot; Language is the interface. The file never leaves.</p>
+    <p>IntentOS &copy; 2026 &middot; <a href="https://github.com/pocProjectWorkspace/intentos">GitHub</a> &middot; <a href="https://github.com/pocProjectWorkspace/intentos/releases">Releases</a> &middot; Language is the interface. The file never leaves.</p>
   </div>
 </footer>
 
@@ -1012,16 +1015,19 @@ function animateCube() {
 }
 animateCube();
 
-// Download handlers — point to latest GitHub Release
+// Download handlers — point to GitHub Release v0.1.0
 const GITHUB_REPO = 'pocProjectWorkspace/intentos';
-const RELEASE_BASE = `https://github.com/${GITHUB_REPO}/releases/latest/download`;
+const RELEASE_TAG = 'v0.1.0';
+const RELEASE_BASE = `https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}`;
+const RELEASE_PAGE = `https://github.com/${GITHUB_REPO}/releases/tag/${RELEASE_TAG}`;
 
 function downloadMac() {
-  window.location.href = `${RELEASE_BASE}/IntentOS-2.0.0-mac-lite.pkg`;
+  window.location.href = `${RELEASE_BASE}/IntentOS-v0.1.0-macOS.dmg`;
 }
 
 function downloadWin() {
-  window.location.href = `${RELEASE_BASE}/IntentOS-2.0.0-win-setup.exe`;
+  // Windows build will be added when CI completes — redirect to release page
+  window.location.href = RELEASE_PAGE;
 }
 </script>
 </body>
