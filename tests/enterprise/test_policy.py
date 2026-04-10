@@ -347,3 +347,71 @@ def test_reload(base):
     engine.reload()
 
     assert engine.check_agent("browser_agent") is False
+
+
+# ===========================================================================
+# License management tests
+# ===========================================================================
+
+
+def test_check_license_valid(base):
+    """20: A non-expired license passes check_license."""
+    policy = _base_policy()
+    policy["license"] = {
+        "key": "INTENT-AAAA-BBBB-CCCC",
+        "tier": "enterprise",
+        "max_devices": 500,
+        "expires_at": "2099-12-31T23:59:59Z",
+    }
+    _write_policy(base, policy)
+    engine = PolicyEngine(base)
+
+    assert engine.is_managed is True
+    assert engine.check_license() is True
+
+
+def test_check_license_expired(base):
+    """21: An expired license fails check_license."""
+    policy = _base_policy()
+    policy["license"] = {
+        "key": "INTENT-DEAD-BEEF-0000",
+        "tier": "enterprise",
+        "max_devices": 500,
+        "expires_at": "2020-01-01T00:00:00Z",
+    }
+    _write_policy(base, policy)
+    engine = PolicyEngine(base)
+
+    assert engine.is_managed is True
+    assert engine.check_license() is False
+
+
+def test_check_license_no_section(base):
+    """22: No license section in policy — check_license returns True (graceful)."""
+    policy = _base_policy()
+    # Ensure no license key exists
+    policy.pop("license", None)
+    _write_policy(base, policy)
+    engine = PolicyEngine(base)
+
+    assert engine.is_managed is True
+    assert engine.check_license() is True
+
+
+def test_get_license_info(base):
+    """23: get_license_info returns the license dict when present."""
+    policy = _base_policy()
+    policy["license"] = {
+        "key": "INTENT-XXXX-YYYY-ZZZZ",
+        "tier": "enterprise",
+        "max_devices": 250,
+        "expires_at": "2027-04-10T00:00:00Z",
+    }
+    _write_policy(base, policy)
+    engine = PolicyEngine(base)
+
+    info = engine.get_license_info()
+    assert info["key"] == "INTENT-XXXX-YYYY-ZZZZ"
+    assert info["tier"] == "enterprise"
+    assert info["max_devices"] == 250
+    assert info["expires_at"] == "2027-04-10T00:00:00Z"

@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -204,7 +205,30 @@ class PolicyEngine:
             return False
         return True
 
+    def check_license(self) -> bool:
+        """Return True if no license section (unmanaged/consumer), or if the license has not expired."""
+        if not self._managed or self._policy is None:
+            return True
+        license_info = self._policy.get("license")
+        if not license_info:
+            return True
+        expires_at = license_info.get("expires_at")
+        if not expires_at:
+            return True
+        try:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) < expiry
+        except (ValueError, TypeError):
+            logger.warning("Invalid expires_at in license section — treating as valid")
+            return True
+
     # -- accessors -----------------------------------------------------------
+
+    def get_license_info(self) -> Dict[str, Any]:
+        """Return the license section from the policy, or empty dict if absent."""
+        if not self._managed or self._policy is None:
+            return {}
+        return dict(self._policy.get("license", {}))
 
     def get_telemetry_config(self) -> Optional[Dict[str, Any]]:
         """Return the telemetry section or None if unmanaged."""
@@ -232,6 +256,7 @@ class PolicyEngine:
             "allowed_agents": self._policy.get("allowed_agents", []),
             "blocked_agents": self._policy.get("blocked_agents", []),
             "spending": self._policy.get("spending", {}),
+            "license": self._policy.get("license", {}),
             "policy_version": self._policy.get("version"),
             "issued_at": self._policy.get("issued_at"),
         }

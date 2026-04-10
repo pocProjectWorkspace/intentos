@@ -158,6 +158,7 @@ class TelemetryReporter:
             "privacy_mode": status.get("privacy_mode", ""),
             "org_id": status.get("org_id", ""),
             "device_id": status.get("device_id", ""),
+            "license": status.get("license", {}),
             "violations_since_last_report": 0,
             "blocked_attempts": [],
         }
