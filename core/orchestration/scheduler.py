@@ -209,13 +209,27 @@ class AgentScheduler:
             self._execution_log.append(result)
             return result
 
+        # Respect the agent's own status if present
+        agent_status = raw_output.get("status", "success")
+        agent_error = None
+        agent_error_code = None
+        if agent_status == "error":
+            err = raw_output.get("error", {})
+            if isinstance(err, dict):
+                agent_error = err.get("message", "Agent returned an error")
+                agent_error_code = err.get("code")
+            else:
+                agent_error = str(err)
+
         result = ExecutionResult(
             agent_name=agent_name,
             action=action,
-            status="success",
+            status=agent_status if agent_status in ("success", "error") else "success",
             output=raw_output,
             duration_ms=elapsed,
             dry_run=dry_run,
+            error=agent_error,
+            error_code=agent_error_code,
             paths_accessed=[path] if path else [],
         )
         self._execution_log.append(result)

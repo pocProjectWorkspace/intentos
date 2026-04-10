@@ -145,8 +145,31 @@ def find_files(params: dict, context: dict) -> dict:
 
     pattern = params.get("pattern", "*")
     extension = params.get("extension") or params.get("type")
+
+    # Map category names to actual file extensions
+    _EXTENSION_CATEGORIES = {
+        "audio": "mp3,wav,aac,flac,ogg,m4a,wma,opus,aiff",
+        "video": "mp4,mkv,avi,mov,wmv,flv,webm,m4v,mpg,mpeg",
+        "image": "jpg,jpeg,png,gif,bmp,svg,webp,tiff,ico,heic",
+        "document": "pdf,doc,docx,xls,xlsx,ppt,pptx,odt,ods,odp,txt,rtf,csv",
+        "code": "py,js,ts,jsx,tsx,java,c,cpp,h,go,rs,rb,php,swift,kt,sh",
+        "archive": "zip,tar,gz,bz2,7z,rar,xz,tgz",
+    }
+    ext_category = None
+    if extension and extension.lower().strip() in _EXTENSION_CATEGORIES:
+        ext_category = extension.lower().strip()
+        extension = _EXTENSION_CATEGORIES[ext_category]
+
+    # Support comma-separated extensions: "mp3,wav,ogg"
+    ext_set = set()
     if extension:
-        pattern = f"*.{extension.lstrip('.')}"
+        for ext in extension.replace(" ", "").split(","):
+            ext = ext.lstrip(".")
+            if ext:
+                ext_set.add(ext.lower())
+        if len(ext_set) == 1:
+            pattern = f"*.{ext_set.pop()}"
+            ext_set = set()  # handled by pattern
 
     modified_after = params.get("modified_after")
     modified_before = params.get("modified_before")
@@ -166,7 +189,11 @@ def find_files(params: dict, context: dict) -> dict:
         for entry in Path(directory).rglob("*"):
             if not entry.is_file():
                 continue
-            if not fnmatch.fnmatch(entry.name.lower(), pattern.lower()):
+            # Multi-extension filter
+            if ext_set:
+                if entry.suffix.lstrip(".").lower() not in ext_set:
+                    continue
+            elif not fnmatch.fnmatch(entry.name.lower(), pattern.lower()):
                 continue
             try:
                 stat = entry.stat()
@@ -194,9 +221,15 @@ def find_files(params: dict, context: dict) -> dict:
         return _error("PERMISSION_DENIED", "I don't have permission to search that folder")
 
     elapsed = int((time.monotonic() - t0) * 1000)
+    if ext_category:
+        label = f"{ext_category} file(s)"
+    elif ext_set:
+        label = f"file(s) with extension {', '.join(sorted(ext_set))}"
+    else:
+        label = f"file(s) matching '{pattern}'"
     return {
         "status": "success",
-        "action_performed": f"Found {len(matches)} file(s) matching '{pattern}'",
+        "action_performed": f"Found {len(matches)} {label}",
         "result": matches,
         "metadata": _meta(
             files_affected=len(matches),

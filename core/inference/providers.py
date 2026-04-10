@@ -80,7 +80,7 @@ DEFAULT_MODELS: Dict[LLMProvider, str] = {
     LLMProvider.ANTHROPIC: "claude-sonnet-4-20250514",
     LLMProvider.OPENAI: "gpt-4o",
     LLMProvider.GEMINI: "gemini-2.0-flash",
-    LLMProvider.OLLAMA: "llama3.1:8b",
+    LLMProvider.OLLAMA: "gemma4:e4b",
     LLMProvider.CUSTOM: "gpt-4o",
 }
 
@@ -106,16 +106,21 @@ class AnthropicBackend:
                 raise RuntimeError("anthropic package not installed")
         return self._client
 
-    def generate(self, prompt: str, model: str | None = None) -> InferenceResult:
+    def generate(self, prompt: str, model: str | None = None, **kwargs: Any) -> InferenceResult:
         model = model or self._default_model
         client = self._ensure_client()
+        max_tokens = kwargs.get("max_tokens", 1024)
+        system = kwargs.get("system")
         start = time.monotonic()
         try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            api_kwargs: Dict[str, Any] = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if system:
+                api_kwargs["system"] = system
+            response = client.messages.create(**api_kwargs)
             elapsed_ms = int((time.monotonic() - start) * 1000)
             text = response.content[0].text if response.content else ""
             return InferenceResult(
@@ -243,26 +248,64 @@ class GeminiBackend:
 
 
 class OllamaBackend:
-    """Local backend wrapping HTTP calls to Ollama."""
+    """Local backend wrapping HTTP calls to Ollama's /api/chat endpoint.
 
-    def __init__(self, base_url: str = "http://localhost:11434", default_model: str = "llama3.1:8b"):
+    Chat-tuned models (llama3.1, mistral, phi3) produce much better
+    structured output when system and user messages are separated properly
+    via the chat API rather than concatenated into a single raw prompt.
+    """
+
+    def __init__(self, base_url: str = "http://localhost:11434", default_model: str = "gemma4:e4b"):
         self._base_url = base_url.rstrip("/")
         self._default_model = default_model
 
-    def generate(self, prompt: str, model: str | None = None) -> InferenceResult:
+    def generate(self, prompt: str, model: str | None = None, **kwargs: Any) -> InferenceResult:
         model = model or self._default_model
         start = time.monotonic()
         try:
             import urllib.request
             import urllib.error
 
+            # Build chat messages — use system prompt if provided via kwargs
+            messages = []
+            images_b64 = kwargs.get("images")  # list of base64 strings
+            system_prompt = kwargs.get("system")
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+                user_msg: Dict[str, Any] = {"role": "user", "content": prompt}
+                if images_b64:
+                    user_msg["images"] = images_b64
+                messages.append(user_msg)
+            else:
+                # Heuristic: if prompt contains the system/user separator pattern
+                # from parse_intent, split it for better instruction following
+                sep = "\n\nUser input: "
+                if sep in prompt:
+                    parts = prompt.split(sep, 1)
+                    system_part = parts[0].strip()
+                    user_part = parts[1].strip()
+                    # Strip trailing "Respond with JSON only." from user part
+                    # and add it to system instead
+                    json_suffix = "\n\nRespond with JSON only."
+                    if user_part.endswith("Respond with JSON only."):
+                        user_part = user_part[: -len("Respond with JSON only.")].strip()
+                        system_part += "\n\nYou MUST respond with valid JSON only. No markdown fences, no explanation."
+                    messages.append({"role": "system", "content": system_part})
+                    messages.append({"role": "user", "content": user_part})
+                else:
+                    user_msg2: Dict[str, Any] = {"role": "user", "content": prompt}
+                    if images_b64:
+                        user_msg2["images"] = images_b64
+                    messages.append(user_msg2)
+
             payload = json.dumps({
                 "model": model,
-                "prompt": prompt,
+                "messages": messages,
                 "stream": False,
+                "options": {"temperature": 0.1},
             }).encode()
             req = urllib.request.Request(
-                f"{self._base_url}/api/generate",
+                f"{self._base_url}/api/chat",
                 data=payload,
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -271,7 +314,8 @@ class OllamaBackend:
                 body = json.loads(resp.read())
 
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            text = body.get("response", "")
+            message = body.get("message", {})
+            text = message.get("content", "")
             input_tokens = body.get("prompt_eval_count", len(prompt) // 4)
             output_tokens = body.get("eval_count", len(text) // 4)
             return InferenceResult(

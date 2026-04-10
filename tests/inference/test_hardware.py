@@ -324,41 +324,41 @@ class TestModelRecommendation:
         assert hasattr(rec, "estimated_ram_gb")
         assert hasattr(rec, "reason")
 
-    def test_4gb_no_gpu_phi3_mini(self):
+    def test_4gb_no_gpu_gemma4_e2b(self):
         profile = self._make_profile(4.0)
         rec = HardwareDetector.recommend_model(profile)
-        assert rec.model_name == "phi3:mini"
+        assert rec.model_name == "gemma4:e2b"
 
-    def test_8gb_no_gpu_mistral_7b(self):
+    def test_8gb_no_gpu_gemma4_e4b(self):
         profile = self._make_profile(8.0)
         rec = HardwareDetector.recommend_model(profile)
-        assert rec.model_name == "mistral:7b-instruct-q4_0"
+        assert rec.model_name == "gemma4:e4b"
 
-    def test_16gb_any_gpu_llama3_8b(self):
+    def test_16gb_any_gpu_gemma4_moe(self):
         gpu = GPUInfo(vendor="nvidia", model="RTX 3060", vram_gb=12.0)
         profile = self._make_profile(16.0, gpu=gpu)
         rec = HardwareDetector.recommend_model(profile)
-        assert rec.model_name == "llama3.1:8b"
+        assert rec.model_name == "gemma4:26b-a4b"
 
-    def test_32gb_nvidia_gpu_llama3_70b(self):
+    def test_32gb_nvidia_gpu_gemma4_moe(self):
         gpu = GPUInfo(vendor="nvidia", model="RTX 4090", vram_gb=24.0)
         profile = self._make_profile(32.0, gpu=gpu)
         rec = HardwareDetector.recommend_model(profile)
-        assert rec.model_name == "llama3.1:70b-instruct-q4_0"
+        assert rec.model_name == "gemma4:26b-a4b"
 
-    def test_apple_silicon_16gb_llama3_8b(self):
+    def test_apple_silicon_16gb_gemma4_moe(self):
         gpu = GPUInfo(vendor="apple", model="Apple M2 Pro", vram_gb=16.0)
         profile = HardwareProfile(
             gpu=gpu, ram_gb=16.0, cpu_cores=10,
             cpu_model="Apple M2 Pro", platform="darwin", arch="arm64",
         )
         rec = HardwareDetector.recommend_model(profile)
-        assert rec.model_name == "llama3.1:8b"
+        assert rec.model_name == "gemma4:26b-a4b"
 
     def test_less_than_4gb_smallest_model(self):
         profile = self._make_profile(2.0)
         rec = HardwareDetector.recommend_model(profile)
-        assert rec.model_name == "qwen2.5:1.5b"
+        assert rec.model_name == "gemma4:e2b"
 
 
 # ---------------------------------------------------------------------------

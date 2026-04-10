@@ -172,7 +172,7 @@ class TestOllamaBackend:
     @patch("urllib.request.urlopen")
     def test_generate_returns_inference_result(self, mock_urlopen):
         body = json.dumps({
-            "response": "Ollama says hi",
+            "message": {"role": "assistant", "content": "Ollama says hi"},
             "prompt_eval_count": 8,
             "eval_count": 4,
         }).encode()

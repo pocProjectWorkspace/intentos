@@ -1,7 +1,7 @@
 """RAG Context Assembler — unified context system for the IntentOS kernel.
 
-Wires TaskIndex, ExperienceRetriever, and FileIndex into a single query
-interface that builds rich context before every task execution.
+Wires TaskIndex, ExperienceRetriever, FileIndex, and ChatStore into a single
+query interface that builds rich context before every task execution.
 """
 
 import logging
@@ -35,6 +35,7 @@ class AssembledContext:
 
     relevant_files: List[Dict[str, Any]] = field(default_factory=list)
     recent_tasks: List[Dict[str, Any]] = field(default_factory=list)
+    related_conversations: List[Dict[str, Any]] = field(default_factory=list)
     user_preferences: Dict[str, Any] = field(default_factory=dict)
     suggestions: List[Dict[str, Any]] = field(default_factory=list)
     context_text: str = ""
@@ -53,6 +54,7 @@ class ContextAssembler:
         task_index: Optional[TaskIndex] = None,
         file_index: Optional[FileIndex] = None,
         experience: Optional[ExperienceRetriever] = None,
+        chat_store: Optional[Any] = None,
         storage_dir: Optional[str] = None,
     ) -> None:
         self.storage_dir: Path = (
@@ -62,6 +64,15 @@ class ContextAssembler:
         self.task_index: TaskIndex = task_index or TaskIndex()
         self.file_index: FileIndex = file_index or FileIndex()
         self.experience: ExperienceRetriever = experience or ExperienceRetriever()
+        self.chat_store: Optional[Any] = chat_store
+
+        # Auto-load ChatStore if not provided
+        if self.chat_store is None:
+            try:
+                from core.storage.chat_store import ChatStore
+                self.chat_store = ChatStore()
+            except Exception:
+                pass
 
         # Auto-load from storage_dir when no explicit indexes supplied
         if task_index is None and file_index is None and experience is None:
@@ -99,10 +110,19 @@ class ContextAssembler:
         # 4. Suggestions
         suggestions = self._query_experience(user_input, suggest_budget)
 
+        # 5. Past conversations (search ChatStore)
+        related_conversations = self._query_chat_history(user_input)
+
+        # 6. Cross-reference: enrich with files from matching tasks
+        relevant_files = self._enrich_files_from_tasks(
+            relevant_files, recent_tasks,
+        )
+
         # Build the context object
         ctx = AssembledContext(
             relevant_files=relevant_files,
             recent_tasks=recent_tasks,
+            related_conversations=related_conversations,
             user_preferences=user_preferences,
             suggestions=suggestions,
         )
@@ -216,6 +236,18 @@ class ContextAssembler:
             pref_lines.append("  (none detected yet)")
         sections.append("\n".join(pref_lines))
 
+        # Related past conversations
+        if assembled.related_conversations:
+            lines = ["Related past conversations:"]
+            for conv in assembled.related_conversations:
+                session_title = conv.get("session_title", "")
+                lines.append(f"  Session: {session_title}")
+                for msg in conv.get("messages", []):
+                    role = msg.get("role", "?")
+                    content = msg.get("content", "")[:200]
+                    lines.append(f"    [{role}] {content}")
+            sections.append("\n".join(lines))
+
         # Suggestions
         if assembled.suggestions:
             lines = ["Suggestions:"]
@@ -281,6 +313,93 @@ class ContextAssembler:
             "preferences": profile.get("preferences", []),
             "frequent_folders": profile.get("frequent_folders", []),
         }
+
+    def _query_chat_history(self, user_input: str) -> List[Dict[str, Any]]:
+        """Search past chat sessions for messages relevant to the query."""
+        if not self.chat_store:
+            return []
+
+        try:
+            # Extract key words (skip common filler words)
+            stop_words = {
+                "the", "a", "an", "is", "was", "were", "are", "in", "on", "at",
+                "to", "for", "of", "with", "and", "or", "but", "not", "it", "my",
+                "we", "i", "you", "that", "this", "where", "what", "how", "can",
+                "do", "did", "about", "from", "last", "week", "file", "find",
+                "worked", "remember", "me", "have", "had", "has",
+            }
+            words = [
+                w for w in user_input.lower().split()
+                if w not in stop_words and len(w) > 2
+            ]
+
+            if not words:
+                return []
+
+            # Search for each meaningful word in chat history
+            all_matches = []
+            seen_sessions = set()
+            for word in words[:5]:  # limit to 5 keywords
+                matches = self.chat_store.search_messages(word, limit=5)
+                for msg in matches:
+                    if msg.session_id not in seen_sessions:
+                        seen_sessions.add(msg.session_id)
+                        all_matches.append(msg)
+
+            if not all_matches:
+                return []
+
+            # For each matching session, get a summary
+            results = []
+            for msg in all_matches[:3]:  # top 3 sessions
+                session = self.chat_store.get_session(msg.session_id)
+                if not session:
+                    continue
+                # Get first few messages for context
+                session_msgs = self.chat_store.get_messages(msg.session_id, limit=6)
+                results.append({
+                    "session_id": session.id,
+                    "session_title": session.title,
+                    "date": session.updated_at,
+                    "messages": [
+                        {"role": m.role, "content": m.content[:200]}
+                        for m in session_msgs
+                    ],
+                })
+
+            return results
+        except Exception:
+            return []
+
+    def _enrich_files_from_tasks(
+        self,
+        files: List[Dict[str, Any]],
+        tasks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Cross-reference: add files mentioned in matching tasks."""
+        existing_paths = {f.get("path", "") for f in files}
+
+        for task in tasks:
+            # TaskRecord stores files_affected — pull from task_index
+            raw_input = task.get("raw_input", "")
+            if not raw_input:
+                continue
+
+            # Find the actual TaskRecord to get files_affected
+            similar = self.task_index.find_similar(raw_input)
+            for rec in similar[:2]:
+                for fpath in rec.files_affected:
+                    if fpath and fpath not in existing_paths and os.path.exists(fpath):
+                        existing_paths.add(fpath)
+                        files.append({
+                            "path": fpath,
+                            "name": os.path.basename(fpath),
+                            "type": os.path.splitext(fpath)[1],
+                            "size": os.path.getsize(fpath) if os.path.exists(fpath) else 0,
+                            "source": "task_history",
+                        })
+
+        return files
 
     def _default_preferences(self) -> Dict[str, Any]:
         """Return default (empty) preferences structure."""

@@ -105,7 +105,7 @@ class TestDetectHardware:
         mock_instance = MockDetector.return_value
         mock_instance.detect.return_value = mock_hardware_profile
         MockDetector.recommend_model.return_value = ModelRecommendation(
-            model_name="llama3.1:8b",
+            model_name="gemma4:26b-a4b",
             model_size="8B",
             estimated_ram_gb=6.0,
             reason="Good for 16GB RAM with GPU.",
@@ -173,22 +173,22 @@ class TestSelectPrivacyMode:
         assert mode == PrivacyMode.LOCAL_ONLY
 
     @patch("builtins.input", return_value="2")
-    def test_input_2_returns_smart_routing(self, mock_input, wizard):
-        """Test 11: Input '2' selects SMART_ROUTING."""
-        mode = wizard.select_privacy_mode(skip_prompts=False)
-        assert mode == PrivacyMode.SMART_ROUTING
-
-    @patch("builtins.input", return_value="3")
-    def test_input_3_returns_performance(self, mock_input, wizard):
-        """Test 12: Input '3' selects PERFORMANCE."""
+    def test_input_2_returns_performance(self, mock_input, wizard):
+        """Test 11: Input '2' selects PERFORMANCE (Connected)."""
         mode = wizard.select_privacy_mode(skip_prompts=False)
         assert mode == PrivacyMode.PERFORMANCE
 
-    @patch("builtins.input", return_value="banana")
-    def test_invalid_defaults_to_smart_routing(self, mock_input, wizard):
-        """Test 13: Invalid input defaults to SMART_ROUTING."""
+    @patch("builtins.input", return_value="3")
+    def test_input_3_returns_smart_routing(self, mock_input, wizard):
+        """Test 12: Input '3' selects SMART_ROUTING."""
         mode = wizard.select_privacy_mode(skip_prompts=False)
         assert mode == PrivacyMode.SMART_ROUTING
+
+    @patch("builtins.input", return_value="banana")
+    def test_invalid_defaults_to_local_only(self, mock_input, wizard):
+        """Test 13: Invalid input defaults to LOCAL_ONLY (Private)."""
+        mode = wizard.select_privacy_mode(skip_prompts=False)
+        assert mode == PrivacyMode.LOCAL_ONLY
 
 
 # ---------------------------------------------------------------------------
@@ -222,16 +222,17 @@ class TestSetupGrants:
 # ---------------------------------------------------------------------------
 
 class TestFullWizardRun:
+    @patch("core.first_run.OllamaManager")
     @patch("core.first_run.CredentialProvider")
     @patch("core.first_run.HardwareDetector")
     @patch("builtins.input", return_value="2")
     @patch("getpass.getpass", return_value="sk-ant-fake-key")
-    def test_run_executes_all_steps(self, mock_gp, mock_input, MockDetector, MockProvider, wizard, tmp_base, mock_hardware_profile):
-        """Test 16: run() executes all steps in order."""
+    def test_run_connected_executes_all_steps(self, mock_gp, mock_input, MockDetector, MockProvider, MockOllama, wizard, tmp_base, mock_hardware_profile):
+        """Test 16: run() with Connected mode executes all steps."""
         mock_det = MockDetector.return_value
         mock_det.detect.return_value = mock_hardware_profile
         MockDetector.recommend_model.return_value = ModelRecommendation(
-            model_name="llama3.1:8b", model_size="8B",
+            model_name="gemma4:26b-a4b", model_size="8B",
             estimated_ram_gb=6.0, reason="Good fit.",
         )
         prov = MockProvider.return_value
@@ -246,38 +247,43 @@ class TestFullWizardRun:
         # Settings were written
         assert (tmp_base / "settings.json").exists()
         assert isinstance(result, FirstRunResult)
+        # Connected mode = PERFORMANCE (input "2")
+        assert result.privacy_mode == PrivacyMode.PERFORMANCE
 
+    @patch.object(FirstRunWizard, "setup_ollama", return_value=(True, ["gemma4:26b-a4b", "nomic-embed-text"]))
+    @patch("core.first_run.OllamaManager")
     @patch("core.first_run.CredentialProvider")
     @patch("core.first_run.HardwareDetector")
     @patch("builtins.input", return_value="1")
-    @patch("getpass.getpass", return_value="sk-ant-fake-key")
-    def test_run_returns_first_run_result(self, mock_gp, mock_input, MockDetector, MockProvider, wizard, tmp_base, mock_hardware_profile):
-        """Test 17: run() returns FirstRunResult with all collected config."""
+    def test_run_private_returns_result(self, mock_input, MockDetector, MockProvider, MockOllama, mock_setup, wizard, tmp_base, mock_hardware_profile):
+        """Test 17: run() with Private mode returns FirstRunResult with Ollama."""
         mock_det = MockDetector.return_value
         mock_det.detect.return_value = mock_hardware_profile
         MockDetector.recommend_model.return_value = ModelRecommendation(
-            model_name="llama3.1:8b", model_size="8B",
+            model_name="gemma4:26b-a4b", model_size="8B",
             estimated_ram_gb=6.0, reason="Good fit.",
         )
         prov = MockProvider.return_value
-        prov.has.return_value = False
+        prov.has.return_value = True
+        MockOllama.return_value.get_status.return_value = MagicMock(installed=True, running=True)
 
         result = wizard.run(skip_prompts=False)
         assert result.is_complete is True
         assert result.privacy_mode == PrivacyMode.LOCAL_ONLY
-        assert result.model_recommendation == "llama3.1:8b"
-        assert result.workspace_path == str(tmp_base)
+        assert result.model_recommendation == "gemma4:26b-a4b"
+        assert "gemma4:26b-a4b" in result.models_pulled
 
+    @patch("core.first_run.OllamaManager")
     @patch("core.first_run.CredentialProvider")
     @patch("core.first_run.HardwareDetector")
     @patch("builtins.input", return_value="2")
     @patch("getpass.getpass", return_value="sk-ant-fake-key")
-    def test_first_run_result_fields(self, mock_gp, mock_input, MockDetector, MockProvider, wizard, tmp_base, mock_hardware_profile):
+    def test_first_run_result_fields(self, mock_gp, mock_input, MockDetector, MockProvider, MockOllama, wizard, tmp_base, mock_hardware_profile):
         """Test 18: FirstRunResult has all required fields."""
         mock_det = MockDetector.return_value
         mock_det.detect.return_value = mock_hardware_profile
         MockDetector.recommend_model.return_value = ModelRecommendation(
-            model_name="llama3.1:8b", model_size="8B",
+            model_name="gemma4:26b-a4b", model_size="8B",
             estimated_ram_gb=6.0, reason="Good fit.",
         )
         prov = MockProvider.return_value
@@ -289,6 +295,8 @@ class TestFullWizardRun:
         assert hasattr(result, "model_recommendation")
         assert hasattr(result, "workspace_path")
         assert hasattr(result, "is_complete")
+        assert hasattr(result, "ollama_status")
+        assert hasattr(result, "models_pulled")
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +309,7 @@ class TestWelcomeMessage:
         result = FirstRunResult(
             hardware_profile=mock_hardware_profile,
             privacy_mode=PrivacyMode.SMART_ROUTING,
-            model_recommendation="llama3.1:8b",
+            model_recommendation="gemma4:26b-a4b",
             workspace_path="/tmp/.intentos",
             is_complete=True,
         )
@@ -309,27 +317,26 @@ class TestWelcomeMessage:
         assert isinstance(msg, str)
         assert len(msg) > 0
 
-    def test_welcome_includes_hardware_model_privacy_path(self, wizard, mock_hardware_profile):
-        """Test 20: Welcome includes detected hardware, model, privacy mode, workspace."""
+    def test_welcome_includes_hardware_model_privacy(self, wizard, mock_hardware_profile):
+        """Test 20: Welcome includes detected hardware, model, privacy mode."""
         result = FirstRunResult(
             hardware_profile=mock_hardware_profile,
             privacy_mode=PrivacyMode.SMART_ROUTING,
-            model_recommendation="llama3.1:8b",
+            model_recommendation="gemma4:26b-a4b",
             workspace_path="/tmp/.intentos",
             is_complete=True,
         )
         msg = wizard.get_welcome_message(result)
         assert "Apple M1" in msg
-        assert "llama3.1:8b" in msg
+        assert "gemma4:26b-a4b" in msg
         assert "Smart" in msg
-        assert "/tmp/.intentos" in msg
 
     def test_welcome_includes_first_task_suggestion(self, wizard, mock_hardware_profile):
         """Test 21: Welcome includes first task suggestion."""
         result = FirstRunResult(
             hardware_profile=mock_hardware_profile,
             privacy_mode=PrivacyMode.SMART_ROUTING,
-            model_recommendation="llama3.1:8b",
+            model_recommendation="gemma4:26b-a4b",
             workspace_path="/tmp/.intentos",
             is_complete=True,
         )
@@ -342,24 +349,27 @@ class TestWelcomeMessage:
 # ---------------------------------------------------------------------------
 
 class TestSkipMode:
+    @patch.object(FirstRunWizard, "setup_ollama", return_value=(False, []))
+    @patch("core.first_run.OllamaManager")
     @patch("core.first_run.CredentialProvider")
     @patch("core.first_run.HardwareDetector")
-    def test_skip_prompts_uses_defaults(self, MockDetector, MockProvider, wizard, tmp_base, mock_hardware_profile):
+    def test_skip_prompts_uses_defaults(self, MockDetector, MockProvider, MockOllama, mock_setup, wizard, tmp_base, mock_hardware_profile):
         """Test 22: run(skip_prompts=True) uses all defaults without user interaction."""
         mock_det = MockDetector.return_value
         mock_det.detect.return_value = mock_hardware_profile
         MockDetector.recommend_model.return_value = ModelRecommendation(
-            model_name="llama3.1:8b", model_size="8B",
+            model_name="gemma4:26b-a4b", model_size="8B",
             estimated_ram_gb=6.0, reason="Good fit.",
         )
         prov = MockProvider.return_value
         prov.has.return_value = True  # key already exists
+        MockOllama.return_value.get_status.return_value = MagicMock(installed=False, running=False)
 
         # No input/getpass patching — should not prompt
         result = wizard.run(skip_prompts=True)
         assert result.is_complete is True
-        assert result.privacy_mode == PrivacyMode.SMART_ROUTING  # default
-        assert result.model_recommendation == "llama3.1:8b"
+        assert result.privacy_mode == PrivacyMode.LOCAL_ONLY  # new default
+        assert result.model_recommendation == "gemma4:26b-a4b"
 
 
 # ---------------------------------------------------------------------------

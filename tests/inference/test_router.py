@@ -18,7 +18,7 @@ class MockLocalBackend:
     def generate(self, prompt, model=None):
         return InferenceResult(
             text="local response",
-            model=model or "phi3:mini",
+            model=model or "gemma4:e4b",
             backend="local",
             input_tokens=10,
             output_tokens=20,
@@ -76,14 +76,14 @@ class TestInferenceResult:
         """Test 2: InferenceResult contains all required fields."""
         r = InferenceResult(
             text="hello",
-            model="phi3:mini",
+            model="gemma4:e4b",
             backend="local",
             input_tokens=5,
             output_tokens=10,
             latency_ms=42,
         )
         assert r.text == "hello"
-        assert r.model == "phi3:mini"
+        assert r.model == "gemma4:e4b"
         assert r.backend == "local"
         assert r.input_tokens == 5
         assert r.output_tokens == 10
@@ -303,10 +303,10 @@ class TestBackendProtocol:
 
 class TestModelConfiguration:
     def test_default_local_model(self):
-        """Test 25: Default local model is phi3:mini."""
+        """Test 25: Default local model is gemma4:e4b."""
         router = _router_with_backends(PrivacyMode.LOCAL_ONLY)
         result = router.route("hello")
-        assert result.model == "phi3:mini"
+        assert result.model == "gemma4:e4b"
 
     def test_default_cloud_model(self):
         """Test 26: Default cloud model is claude-sonnet-4-20250514."""

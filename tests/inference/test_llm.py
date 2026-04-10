@@ -20,7 +20,7 @@ from core.orchestration.cost_manager import BudgetExceededException
 
 def _make_inference_result(
     text: str = "Hello world",
-    model: str = "phi3:mini",
+    model: str = "gemma4:e4b",
     backend: str = "local",
     input_tokens: int = 10,
     output_tokens: int = 20,
@@ -62,17 +62,17 @@ def _build_service(privacy_mode=PrivacyMode.SMART_ROUTING, budget=None):
         from core.inference.hardware import ModelRecommendation
 
         detector_instance.recommend_model.return_value = ModelRecommendation(
-            model_name="llama3.1:8b",
-            model_size="8B",
+            model_name="gemma4:26b-a4b",
+            model_size="26B",
             estimated_ram_gb=6.0,
-            reason="16 GB+ RAM with GPU acceleration supports 8B model well.",
+            reason="16 GB+ RAM with GPU acceleration supports 26B model well.",
         )
         svc = LLMService(privacy_mode=privacy_mode, budget=budget)
 
     # Inject mock backends
     local_backend = MagicMock()
     local_backend.generate.return_value = _make_inference_result(
-        text="local response", model="phi3:mini", backend="local",
+        text="local response", model="gemma4:e4b", backend="local",
         input_tokens=10, output_tokens=20, latency_ms=50,
     )
     cloud_backend = MagicMock()
@@ -119,7 +119,7 @@ class TestInitialization:
         """4. get_recommended_model() returns model recommendation."""
         svc = _build_service()
         rec = svc.get_recommended_model()
-        assert rec.model_name == "llama3.1:8b"
+        assert rec.model_name == "gemma4:26b-a4b"
 
 
 # ===========================================================================
@@ -230,15 +230,16 @@ class TestBudgetEnforcement:
 
     def test_generate_raises_budget_exceeded(self):
         """15. generate() raises BudgetExceededException when budget exhausted (strict)."""
-        svc = _build_service(budget=0.0000001)
-        # The budget is tiny; first call should push past it on strict mode
+        # Use PERFORMANCE mode to route to cloud (which has real cost)
+        svc = _build_service(privacy_mode=PrivacyMode.PERFORMANCE, budget=0.0000001)
         svc._cost_manager._strict = True
         with pytest.raises(BudgetExceededException):
             svc.generate("prompt")
 
     def test_get_remaining_budget(self):
         """16. get_remaining_budget() returns remaining."""
-        svc = _build_service(budget=5.0)
+        # Use PERFORMANCE mode to route to cloud (which has real cost)
+        svc = _build_service(privacy_mode=PrivacyMode.PERFORMANCE, budget=5.0)
         remaining = svc.get_remaining_budget()
         assert remaining == 5.0
         svc.generate("prompt")

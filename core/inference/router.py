@@ -77,7 +77,7 @@ class InferenceRouter:
         self._local_threshold = local_threshold
         self._local_backend: Optional[InferenceBackend] = None
         self._cloud_backend: Optional[InferenceBackend] = None
-        self._local_model: str = "phi3:mini"
+        self._local_model: str = "gemma4:e4b"
         self._cloud_model: str = "claude-sonnet-4-20250514"
         self._consent_callback: Optional[Callable] = None
 

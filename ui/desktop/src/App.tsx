@@ -5,29 +5,40 @@ import { TaskHistory } from './components/TaskHistory';
 import { ResultPane } from './components/ResultPane';
 import { Settings } from './components/Settings';
 import { StatusBar } from './components/StatusBar';
+import { SetupWizard } from './components/SetupWizard';
 import { useIntentOS } from './hooks/useIntentOS';
-import type { Task } from './types';
+import { isTauri } from './lib/platform';
 import './App.css';
 
 function App() {
-  const { tasks, settings, isLoading, submitTask, updateSettings } = useIntentOS();
-  const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+  const {
+    tasks, settings, isLoading, stream,
+    sessions, activeSessionId, chatMessages,
+    submitTask, stopTask, updateSettings,
+    loadSession, newSession, deleteSession,
+  } = useIntentOS();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [setupComplete, setSetupComplete] = useState(!isTauri());
+
+  if (!setupComplete) {
+    return <SetupWizard onComplete={() => setSetupComplete(true)} />;
+  }
+
+  // Get the latest task (for suggestions display)
+  const latestTask = tasks[0] ?? null;
 
   const handleSubmit = useCallback(
-    async (input: string) => {
-      const task = await submitTask(input);
-      setSelectedTask(task);
+    async (input: string, fileId?: string) => {
+      await submitTask(input, fileId);
     },
     [submitTask],
   );
 
-  const handleSelectTask = useCallback(
-    (taskId: string) => {
-      const task = tasks.find((t) => t.id === taskId) ?? null;
-      setSelectedTask(task);
+  const handleSelectSession = useCallback(
+    async (sessionId: string) => {
+      await loadSession(sessionId);
     },
-    [tasks],
+    [loadSession],
   );
 
   return (
@@ -46,15 +57,24 @@ function App() {
       <div className="app__body">
         <TaskHistory
           tasks={tasks}
-          onSelect={handleSelectTask}
-          selectedId={selectedTask?.id}
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          onSelect={() => {}}
+          onSelectSession={handleSelectSession}
+          onNewSession={newSession}
+          onDeleteSession={deleteSession}
         />
         <main className="app__main">
-          <ResultPane task={selectedTask} />
+          <ResultPane
+            task={latestTask}
+            stream={stream}
+            chatMessages={chatMessages}
+            onSuggestionClick={handleSubmit}
+          />
         </main>
       </div>
 
-      <TaskInput onSubmit={handleSubmit} isLoading={isLoading} />
+      <TaskInput onSubmit={handleSubmit} isLoading={isLoading} onStop={stopTask} />
 
       <StatusBar
         settings={settings}

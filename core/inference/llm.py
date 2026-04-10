@@ -7,6 +7,7 @@ the kernel calls for all LLM operations.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -88,6 +89,77 @@ def get_provider_config(credential_provider: Any) -> Optional[ProviderConfig]:
 # Approximate max context window in tokens for truncation logic
 _DEFAULT_MAX_CONTEXT_TOKENS = 4096
 
+# Regex to extract JSON from markdown-fenced responses (```json ... ```)
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
+
+
+def _extract_json(text: str) -> Optional[Dict]:
+    """Extract a JSON object from LLM output that may contain extra text.
+
+    Local models (llama, mistral, phi) commonly wrap JSON in markdown fences
+    or add conversational preamble/epilogue.  We try, in order:
+      1. Direct json.loads (clean output)
+      2. Extract from ```json ... ``` fences
+      3. Find the first { ... } substring via brace matching
+    """
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # 1. Direct parse
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 2. Markdown fence extraction
+    fence_match = _JSON_FENCE_RE.search(text)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 3. First { ... } brace-matched substring
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    break
+
+    return None
+
+
+_CONDENSED_SYSTEM_PROMPT = """\
+You are a JSON intent parser. Given a user instruction, return ONLY valid JSON (no markdown, no explanation).
+
+Schema:
+{"raw_input": "<exact user text>", "intent": "<category.action>", "subtasks": [{"id": "1", "agent": "<agent>", "action": "<action>", "params": {}}]}
+
+Agents and key params:
+- file_agent: list_files {path, extension, recursive}, find_files {path, pattern, extension, size_gt}, get_disk_usage {path}, rename_file {path, new_name}, move_file {source, destination}, copy_file {source, destination}, delete_file {path}, read_file {path}, get_metadata {path}, organize_by_type {path}
+- browser_agent: search_web {query, max_results}, fetch_page {url}, extract_data {url, description}
+- document_agent: create_document {filename, content, title}, read_document {path}, convert_document {path, format}
+- system_agent: get_current_date {format}
+- image_agent: remove_background {path}, resize {path, width, height}
+
+ONLY use actions listed above. Never invent actions like "count". To find files by type, use file_agent.find_files with extension. Keep it to 1 subtask when possible. Use ~ for home paths. Return JSON only."""
+
+
+def _build_condensed_prompt(user_input: str) -> str:
+    """Build a short prompt for local models that struggle with the full system prompt."""
+    return f"{_CONDENSED_SYSTEM_PROMPT}\n\nUser input: {user_input}\n\nRespond with JSON only."
+
 
 class LLMService:
     """Unified inference interface for the IntentOS kernel.
@@ -163,12 +235,32 @@ class LLMService:
         if cloud_backend is not None:
             self._router.set_cloud_backend(cloud_backend)
 
-        # Local backend (Ollama — only if running)
+        # Local backend (Ollama — only if running and has a model)
         try:
             import urllib.request
-            urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
-            local = OllamaBackend(default_model=self._model_rec.model_name)
-            self._router.set_local_backend(local)
+            import json as _json
+            resp = urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
+            tags = _json.loads(resp.read())
+            installed = [m["name"] for m in tags.get("models", [])]
+
+            # Pick the best available model: prefer recommended, then any Gemma 4,
+            # then any installed chat model (skip embedding models).
+            rec = self._model_rec.model_name
+            chosen = None
+            if any(rec == m or rec == m.split(":")[0] for m in installed):
+                chosen = rec
+            else:
+                # Preference order for fallback
+                for candidate in installed:
+                    if candidate.startswith("nomic-embed") or candidate.startswith("all-minilm"):
+                        continue  # skip embedding models
+                    chosen = candidate
+                    break
+
+            if chosen:
+                local = OllamaBackend(default_model=chosen)
+                self._router.set_local_backend(local)
+                self._router.set_local_model(chosen)
         except Exception:
             pass  # Ollama not running
 
@@ -244,13 +336,31 @@ class LLMService:
     # -- Intent parsing -----------------------------------------------------
 
     def parse_intent(self, user_input: str, system_prompt: str) -> Optional[Dict]:
-        """Convenience: generate a response and attempt to parse it as JSON."""
+        """Parse user input into a structured intent JSON.
+
+        Uses the full system prompt first.  If that fails (common with smaller
+        local models), retries once with a condensed prompt that fits better
+        in limited context windows and produces more reliable JSON.
+        """
+        # Attempt 1: full system prompt
         full_prompt = f"{system_prompt}\n\nUser input: {user_input}\n\nRespond with JSON only."
         resp = self.generate(full_prompt, task_type="intent_parsing")
-        try:
-            return json.loads(resp.text)
-        except (json.JSONDecodeError, TypeError):
-            return None
+
+        if resp.text:
+            result = _extract_json(resp.text)
+            if result is not None:
+                return result
+
+        # Attempt 2: condensed prompt optimized for small local models
+        condensed = _build_condensed_prompt(user_input)
+        resp2 = self.generate(condensed, task_type="intent_parsing")
+
+        if resp2.text:
+            result = _extract_json(resp2.text)
+            if result is not None:
+                return result
+
+        return None
 
     # -- Summarization ------------------------------------------------------
 

@@ -1,30 +1,20 @@
 """IntentOS Speech-to-Text module.
 
-Provides voice input for task submission via microphone or audio file.
-Supports multiple STT backends with graceful fallbacks when dependencies
-(like pyaudio) are unavailable.
+Primary backend: faster-whisper (local, MIT, runs on CPU/GPU).
+Fallback: speech_recognition + Google free API.
+
+All backends are lazy-loaded — missing dependencies degrade gracefully.
 """
 
 from __future__ import annotations
 
 import enum
 import os
+import tempfile
 import time
 import wave
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
-
-# ---------------------------------------------------------------------------
-# Lazy imports — these may not be installed
-# ---------------------------------------------------------------------------
-
-def _import_speech_recognition():
-    """Import speech_recognition, returning None if unavailable."""
-    try:
-        import speech_recognition as sr
-        return sr
-    except ImportError:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -33,10 +23,10 @@ def _import_speech_recognition():
 
 class STTProvider(enum.Enum):
     """Available speech-to-text backends."""
-    SYSTEM = "system"                   # Google free API via speech_recognition
-    WHISPER_LOCAL = "whisper_local"      # Local Whisper via Ollama
-    GOOGLE_CLOUD = "google_cloud"       # Google Cloud Speech API
+    FASTER_WHISPER = "faster_whisper"    # Local Whisper via faster-whisper
+    SYSTEM = "system"                    # Google free API via speech_recognition
     OPENAI_WHISPER_API = "openai_whisper_api"  # OpenAI Whisper API
+    GOOGLE_CLOUD = "google_cloud"        # Google Cloud Speech API
 
 
 # ---------------------------------------------------------------------------
@@ -57,48 +47,71 @@ class STTResult:
 # VoiceInput
 # ---------------------------------------------------------------------------
 
+# Whisper model cache (loaded once, reused)
+_whisper_model = None
+_whisper_model_name = None
+
+
 class VoiceInput:
     """Speech-to-text input for IntentOS.
 
-    Handles microphone recording, audio transcription, and convenient
-    one-call listen-and-transcribe workflows.  Designed to degrade
-    gracefully when pyaudio or speech_recognition are missing.
+    Primary: faster-whisper with large-v3-turbo (best quality/speed).
+    Fallback: speech_recognition + Google free API.
     """
 
-    def __init__(self, provider: STTProvider = STTProvider.SYSTEM) -> None:
+    def __init__(
+        self,
+        provider: STTProvider = STTProvider.FASTER_WHISPER,
+        model_size: str = "large-v3-turbo",
+    ) -> None:
         self._provider = provider
-        self._sr = _import_speech_recognition()
+        self._model_size = model_size
 
     # -- availability -------------------------------------------------------
 
     def is_available(self) -> bool:
-        """Check whether microphone + speech_recognition are usable."""
-        sr = self._sr
-        if sr is None:
-            return False
+        """Check whether voice input is usable."""
+        if self._provider == STTProvider.FASTER_WHISPER:
+            try:
+                from faster_whisper import WhisperModel  # noqa: F401
+                return True
+            except ImportError:
+                pass
+
+        # Fall back to checking speech_recognition
         try:
-            mic = sr.Microphone()
+            import speech_recognition as sr
+            sr.Microphone()
             return True
-        except (OSError, AttributeError, ImportError):
+        except (ImportError, OSError, AttributeError):
             return False
+
+    def get_best_available(self) -> STTProvider:
+        """Return the best available provider."""
+        try:
+            from faster_whisper import WhisperModel  # noqa: F401
+            return STTProvider.FASTER_WHISPER
+        except ImportError:
+            pass
+
+        try:
+            import speech_recognition as sr
+            sr.Microphone()
+            return STTProvider.SYSTEM
+        except (ImportError, OSError):
+            pass
+
+        return STTProvider.SYSTEM
 
     # -- recording ----------------------------------------------------------
 
-    def record(
-        self,
-        duration_seconds: float = 5,
-        silence_timeout: float = 2.0,
-    ) -> Any:
-        """Record audio from the microphone.
+    def record(self, duration_seconds: float = 5) -> Optional[str]:
+        """Record audio from microphone, save to temp WAV file.
 
-        Returns a ``speech_recognition.AudioData`` object, or *None*
-        if recording is not possible.
+        Returns the path to the WAV file, or None on failure.
         """
-        sr = self._sr
-        if sr is None:
-            return None
-
         try:
+            import speech_recognition as sr
             recognizer = sr.Recognizer()
             with sr.Microphone() as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.5)
@@ -107,53 +120,98 @@ class VoiceInput:
                     timeout=duration_seconds,
                     phrase_time_limit=duration_seconds,
                 )
-                return audio
+
+            # Save to temp file
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.write(audio.get_wav_data())
+            tmp.close()
+            return tmp.name
         except Exception:
             return None
 
     # -- transcription ------------------------------------------------------
 
-    def transcribe(
+    def transcribe_file(
         self,
-        audio_data: Any,
+        audio_path: str,
         provider: Optional[STTProvider] = None,
     ) -> Optional[STTResult]:
-        """Transcribe audio data using the specified provider.
-
-        Args:
-            audio_data: A ``speech_recognition.AudioData`` object.
-            provider: Override the default provider for this call.
-
-        Returns:
-            An ``STTResult``, or *None* on failure.
-        """
+        """Transcribe an audio file using the specified provider."""
         provider = provider or self._provider
-        sr = self._sr
-
-        if audio_data is None:
-            return None
-
         start = time.monotonic()
 
+        if provider == STTProvider.FASTER_WHISPER:
+            result = self._transcribe_faster_whisper(audio_path, start)
+            if result:
+                return result
+            # Fall through to system
+            provider = STTProvider.SYSTEM
+
         if provider == STTProvider.SYSTEM:
-            return self._transcribe_system(audio_data, sr, start)
-        elif provider == STTProvider.WHISPER_LOCAL:
-            return self._transcribe_whisper_local(audio_data, start)
-        elif provider == STTProvider.OPENAI_WHISPER_API:
-            return self._transcribe_openai_whisper(audio_data, start)
-        elif provider == STTProvider.GOOGLE_CLOUD:
-            return self._transcribe_google_cloud(audio_data, sr, start)
+            return self._transcribe_system(audio_path, start)
+
+        if provider == STTProvider.OPENAI_WHISPER_API:
+            return self._transcribe_openai_whisper(audio_path, start)
 
         return None
 
-    def _transcribe_system(self, audio_data: Any, sr: Any, start: float) -> Optional[STTResult]:
-        """Transcribe using Google free web API (via speech_recognition)."""
-        if sr is None:
-            return None
+    def _transcribe_faster_whisper(
+        self, audio_path: str, start: float,
+    ) -> Optional[STTResult]:
+        """Transcribe using faster-whisper (local, fast, high quality)."""
+        global _whisper_model, _whisper_model_name
+
         try:
-            recognizer = sr.Recognizer()
-            text = recognizer.recognize_google(audio_data)
+            from faster_whisper import WhisperModel
+
+            # Load model (cached after first use)
+            if _whisper_model is None or _whisper_model_name != self._model_size:
+                _whisper_model = WhisperModel(
+                    self._model_size,
+                    device="auto",
+                    compute_type="auto",
+                )
+                _whisper_model_name = self._model_size
+
+            segments, info = _whisper_model.transcribe(
+                audio_path,
+                beam_size=5,
+                language="en",
+                vad_filter=True,
+            )
+
+            text_parts = []
+            for segment in segments:
+                text_parts.append(segment.text.strip())
+
+            text = " ".join(text_parts)
             duration = time.monotonic() - start
+
+            return STTResult(
+                text=text,
+                confidence=round(info.language_probability, 2) if info else 0.9,
+                provider="faster_whisper",
+                duration_seconds=round(duration, 2),
+                language=info.language if info else "en",
+            )
+        except ImportError:
+            return None
+        except Exception:
+            return None
+
+    def _transcribe_system(
+        self, audio_path: str, start: float,
+    ) -> Optional[STTResult]:
+        """Transcribe using Google free API via speech_recognition."""
+        try:
+            import speech_recognition as sr
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(audio_path) as source:
+                audio = recognizer.record(source)
+
+            text = recognizer.recognize_google(audio)
+            duration = time.monotonic() - start
+
             return STTResult(
                 text=text,
                 confidence=0.85,
@@ -164,55 +222,23 @@ class VoiceInput:
         except Exception:
             return None
 
-    def _transcribe_whisper_local(self, audio_data: Any, start: float) -> Optional[STTResult]:
-        """Transcribe via local Ollama Whisper model."""
-        try:
-            import requests  # noqa: F811
-            # Ollama transcription endpoint
-            resp = requests.post(
-                "http://localhost:11434/api/transcribe",
-                json={"audio": "base64_placeholder"},
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                duration = time.monotonic() - start
-                return STTResult(
-                    text=data.get("text", ""),
-                    confidence=data.get("confidence", 0.9),
-                    provider="whisper_local",
-                    duration_seconds=round(duration, 2),
-                    language=data.get("language", "en"),
-                )
-        except Exception:
-            pass
-        return None
-
-    def _transcribe_openai_whisper(self, audio_data: Any, start: float) -> Optional[STTResult]:
+    def _transcribe_openai_whisper(
+        self, audio_path: str, start: float,
+    ) -> Optional[STTResult]:
         """Transcribe via OpenAI Whisper API."""
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             return None
         try:
             import requests
-            import tempfile
-
-            # Write audio to a temp wav file for the API
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                f.write(audio_data.get_wav_data())
-                tmp_path = f.name
-
-            with open(tmp_path, "rb") as audio_file:
+            with open(audio_path, "rb") as f:
                 resp = requests.post(
                     "https://api.openai.com/v1/audio/transcriptions",
                     headers={"Authorization": f"Bearer {api_key}"},
-                    files={"file": ("audio.wav", audio_file, "audio/wav")},
+                    files={"file": ("audio.wav", f, "audio/wav")},
                     data={"model": "whisper-1"},
                     timeout=30,
                 )
-
-            os.unlink(tmp_path)
-
             if resp.status_code == 200:
                 data = resp.json()
                 duration = time.monotonic() - start
@@ -227,27 +253,6 @@ class VoiceInput:
             pass
         return None
 
-    def _transcribe_google_cloud(self, audio_data: Any, sr: Any, start: float) -> Optional[STTResult]:
-        """Transcribe via Google Cloud Speech API (requires credentials)."""
-        if sr is None:
-            return None
-        try:
-            credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            if not credentials_json:
-                return None
-            recognizer = sr.Recognizer()
-            text = recognizer.recognize_google_cloud(audio_data)
-            duration = time.monotonic() - start
-            return STTResult(
-                text=text,
-                confidence=0.92,
-                provider="google_cloud",
-                duration_seconds=round(duration, 2),
-                language="en",
-            )
-        except Exception:
-            return None
-
     # -- convenience --------------------------------------------------------
 
     def listen_and_transcribe(
@@ -256,20 +261,24 @@ class VoiceInput:
         provider: Optional[STTProvider] = None,
     ) -> Optional[STTResult]:
         """Record from microphone and transcribe in one call."""
-        audio = self.record(duration_seconds=duration)
-        if audio is None:
+        audio_path = self.record(duration_seconds=duration)
+        if audio_path is None:
             return None
-        return self.transcribe(audio, provider=provider)
+
+        try:
+            result = self.transcribe_file(audio_path, provider=provider)
+            return result
+        finally:
+            # Cleanup temp file
+            try:
+                os.unlink(audio_path)
+            except OSError:
+                pass
 
     def voice_prompt(self) -> Optional[str]:
-        """Interactive voice prompt for CLI use.
-
-        Shows a 'Listening...' indicator, records, transcribes, and
-        returns the text.  Returns *None* with a printed message if
-        voice input is not available.
-        """
+        """Interactive voice prompt for CLI use."""
         if not self.is_available():
-            print("  Voice input not available. Install: pip install SpeechRecognition pyaudio")
+            print("  Voice input not available. Install: pip install faster-whisper SpeechRecognition pyaudio")
             return None
 
         print("  Listening... (speak now)")
@@ -279,34 +288,3 @@ class VoiceInput:
 
         print("  Could not understand audio.")
         return None
-
-    # -- file transcription -------------------------------------------------
-
-    def transcribe_file(
-        self,
-        audio_path: str,
-        provider: Optional[STTProvider] = None,
-    ) -> Optional[STTResult]:
-        """Transcribe an audio file (.wav or .mp3).
-
-        Args:
-            audio_path: Path to the audio file.
-            provider: STT backend to use (defaults to instance default).
-
-        Returns:
-            An ``STTResult``, or *None* on failure.
-        """
-        sr = self._sr
-        if sr is None:
-            return None
-
-        if not os.path.isfile(audio_path):
-            return None
-
-        try:
-            recognizer = sr.Recognizer()
-            with sr.AudioFile(audio_path) as source:
-                audio = recognizer.record(source)
-            return self.transcribe(audio, provider=provider)
-        except Exception:
-            return None

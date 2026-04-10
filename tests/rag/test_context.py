@@ -487,7 +487,15 @@ class TestEdgeCases:
 
     def test_all_indexes_empty_graceful(self):
         """Test 30: All indexes empty returns graceful minimal context."""
-        ca = ContextAssembler()
+        from core.rag.task_index import TaskIndex
+        from core.rag.file_index import FileIndex
+        from core.rag.experience import ExperienceRetriever
+        ca = ContextAssembler(
+            task_index=TaskIndex(),
+            file_index=FileIndex(),
+            experience=ExperienceRetriever(),
+            chat_store=None,
+        )
         ctx = ca.build_context("do something")
         assert isinstance(ctx, AssembledContext)
         assert isinstance(ctx.context_text, str)

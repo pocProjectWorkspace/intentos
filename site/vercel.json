@@ -1,0 +1,21 @@
+{
+  "buildCommand": null,
+  "outputDirectory": ".",
+  "rewrites": [
+    { "source": "/download/mac", "destination": "https://github.com/pocProjectWorkspace/intentos/releases/latest/download/IntentOS-2.0.0-mac-lite.pkg" },
+    { "source": "/download/win", "destination": "https://github.com/pocProjectWorkspace/intentos/releases/latest/download/IntentOS-2.0.0-win-setup.exe" }
+  ],
+  "redirects": [
+    { "source": "/github", "destination": "https://github.com/pocProjectWorkspace/intentos", "permanent": false }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+      ]
+    }
+  ]
+}

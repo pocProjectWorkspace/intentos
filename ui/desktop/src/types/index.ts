@@ -5,8 +5,11 @@ export interface Task {
   status: 'pending' | 'executing' | 'success' | 'error';
   subtasks: Subtask[];
   result?: any;
+  report?: string;
   error?: string;
+  costUsd?: number;
   durationMs?: number;
+  suggestions?: string[];
   createdAt: string;
 }
 
@@ -23,6 +26,25 @@ export interface Settings {
   localModel: string;
   cloudModel: string;
   workspacePath: string;
+}
+
+export interface ChatSession {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  sessionId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  fileName?: string;
+  costUsd?: number;
+  durationMs?: number;
+  createdAt: string;
 }
 
 export interface HardwareProfile {

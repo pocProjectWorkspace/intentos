@@ -108,7 +108,7 @@ class TestSettings:
 
         s = Settings()
         assert s.privacy_mode == "smart_routing"
-        assert s.local_model == "phi3:mini"
+        assert s.local_model == "gemma4:e4b"
         assert s.cloud_model == "claude-sonnet-4-20250514"
         assert s.cloud_provider == "anthropic"
         assert s.auto_compact_threshold == 50

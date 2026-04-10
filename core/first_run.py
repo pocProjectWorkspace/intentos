@@ -12,12 +12,22 @@ import enum
 import getpass
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, List, Optional
 
 from core.inference.hardware import HardwareDetector, HardwareProfile, ModelRecommendation
 from core.inference.providers import LLMProvider, DEFAULT_MODELS
+from core.inference.ollama_manager import (
+    OllamaManager,
+    OllamaStatus,
+    PullProgress,
+    OllamaInstallError,
+    OllamaConnectionError,
+    OllamaModelPullError,
+    EMBEDDING_MODEL,
+)
 from core.security.credential_provider import CredentialProvider
 
 
@@ -46,6 +56,8 @@ class FirstRunResult:
     workspace_path: str = ""
     is_complete: bool = False
     llm_provider: Optional[LLMProvider] = None
+    ollama_status: Optional[OllamaStatus] = None
+    models_pulled: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -198,24 +210,30 @@ class FirstRunWizard:
     # ------------------------------------------------------------------
 
     def select_privacy_mode(self, skip_prompts: bool = False) -> PrivacyMode:
-        """Prompt the user to choose a privacy/inference mode."""
+        """Prompt the user to choose a privacy/inference mode.
+
+        Default is Private (LOCAL_ONLY) per FIRST_LAUNCH.md.
+        """
         if skip_prompts:
-            return PrivacyMode.SMART_ROUTING
+            return PrivacyMode.LOCAL_ONLY
 
         print("\n  How would you like IntentOS to think?\n")
         print("    [1] Private     \u2014 Runs entirely on your device. Works offline.")
-        print("    [2] Smart       \u2014 Simple tasks stay local. Complex tasks use your AI account.")
-        print("    [3] Connected   \u2014 Uses your AI account for everything. Best quality.")
-        print()
+        print("                      Nothing leaves your computer. Ever.")
+        print("                      One-time setup: ~2 GB download\n")
+        print("    [2] Connected   \u2014 Uses your AI account for everything.")
+        print("                      No download needed. Requires internet.\n")
+        print("    [3] Smart       \u2014 Simple tasks stay local.")
+        print("                      Complex tasks use your AI account.\n")
 
-        choice = input("  Choose [1/2/3] (default: 2): ").strip()
+        choice = input("  Choose [1/2/3] (default: 1): ").strip()
 
         mapping = {
             "1": PrivacyMode.LOCAL_ONLY,
-            "2": PrivacyMode.SMART_ROUTING,
-            "3": PrivacyMode.PERFORMANCE,
+            "2": PrivacyMode.PERFORMANCE,
+            "3": PrivacyMode.SMART_ROUTING,
         }
-        return mapping.get(choice, PrivacyMode.SMART_ROUTING)
+        return mapping.get(choice, PrivacyMode.LOCAL_ONLY)
 
     # ------------------------------------------------------------------
     # Grants
@@ -236,29 +254,165 @@ class FirstRunWizard:
         grants_path.write_text(json.dumps(grants, indent=2))
 
     # ------------------------------------------------------------------
+    # Ollama setup (Screen 3A)
+    # ------------------------------------------------------------------
+
+    def setup_ollama(
+        self,
+        hardware_profile: HardwareProfile,
+        model_name: str,
+        skip_prompts: bool = False,
+    ) -> tuple:
+        """Install Ollama if needed, pull recommended model + embeddings.
+
+        Returns (success: bool, models_pulled: list[str]).
+        """
+        manager = OllamaManager()
+
+        # Check disk space
+        warning = manager.check_disk_space(model_name)
+        if warning:
+            print(f"\n  {warning}")
+            if not skip_prompts:
+                proceed = input("  Continue anyway? [y/N]: ").strip()
+                if not proceed or proceed.lower() != "y":
+                    return (False, [])
+
+        # Install if needed
+        if not manager.is_installed():
+            if not skip_prompts:
+                print("\n  IntentOS needs a small engine to run AI on your device.")
+                print("  This is a one-time install (~100 MB).\n")
+                proceed = input("  Install now? [Y/n]: ").strip()
+                if proceed.lower() == "n":
+                    return (False, [])
+
+            print("  Installing local AI engine...")
+            try:
+                manager.install(silent=True)
+                print("  [ok] Installed\n")
+            except OllamaInstallError as exc:
+                print(f"\n  {exc}\n")
+                return (False, [])
+        else:
+            print("  [ok] Local AI engine found\n")
+
+        # Setup header
+        print("  Setting up your thinking engine\n")
+        print("  This happens once and takes a few minutes.")
+        print("  After this, IntentOS works instantly \u2014 even")
+        print("  without an internet connection.\n")
+
+        # Pull models
+        result = manager.setup_for_local(
+            model_name,
+            progress_callback=self._print_pull_progress,
+        )
+        print()  # newline after progress
+
+        if result["success"]:
+            pulled = result["models_pulled"]
+            print(f"  [ok] {len(pulled)} component(s) ready\n")
+            return (True, pulled)
+        else:
+            for err in result["errors"]:
+                print(f"  [!!] {err}")
+            print()
+            return (False, result.get("models_pulled", []))
+
+    @staticmethod
+    def _print_pull_progress(progress: PullProgress) -> None:
+        """Format and print model pull progress."""
+        # Map status to plain-language labels
+        labels = {
+            "downloading": "Downloading your local AI...",
+            "unpacking": "Almost there \u2014 unpacking...",
+            "verifying": "Running a quick check...",
+            "complete": "Ready!",
+        }
+        # Switch label when pulling embedding model
+        if progress.model == EMBEDDING_MODEL:
+            labels["downloading"] = "Setting up your search engine..."
+
+        label = labels.get(progress.status, progress.status)
+
+        if progress.status == "complete":
+            print(f"  [ok] {progress.model}")
+        elif progress.total_gb > 0:
+            bar_width = 22
+            filled = int(bar_width * progress.percent / 100)
+            bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
+            print(f"\r  [{bar}] {progress.percent:5.1f}%  {label}", end="", flush=True)
+        else:
+            print(f"\r  {label}", end="", flush=True)
+
+    # ------------------------------------------------------------------
     # Full run
     # ------------------------------------------------------------------
 
     def run(self, skip_prompts: bool = False) -> FirstRunResult:
-        """Execute every first-run step and return the collected config."""
+        """Execute every first-run step and return the collected config.
+
+        Flow matches FIRST_LAUNCH.md:
+          Screen 1: Welcome (caller handles this)
+          Screen 2: The ONE Choice (privacy mode)
+          Screen 3A: Local setup (Ollama install + model pull)
+          Screen 3B: Cloud setup (provider + API key)
+          Screen 4: Ready
+        """
 
         # 1. Workspace
         self.setup_workspace()
 
-        # 2. Hardware
+        # 2. Hardware detection (silent)
         profile = self.detect_hardware()
         model_name = self.recommend_model(profile)
 
-        # 3. Privacy mode
+        # 3. Screen 2: The ONE Choice
         privacy = self.select_privacy_mode(skip_prompts=skip_prompts)
 
-        # 4. Provider selection
-        chosen_provider = self.select_provider(skip_prompts=skip_prompts)
+        # 4. Branch based on choice
+        ollama_status = None
+        models_pulled: list = []
+        chosen_provider = LLMProvider.OLLAMA  # default
 
-        # 5. Credentials (with provider context)
-        self.setup_credentials(skip_prompts=skip_prompts, llm_provider=chosen_provider)
+        needs_local = privacy in (PrivacyMode.LOCAL_ONLY, PrivacyMode.SMART_ROUTING)
+        needs_cloud = privacy in (PrivacyMode.PERFORMANCE, PrivacyMode.SMART_ROUTING)
 
-        # 6. Grants
+        # Screen 3A: Local setup (if Private or Smart)
+        if needs_local:
+            success, models_pulled = self.setup_ollama(
+                hardware_profile=profile,
+                model_name=model_name,
+                skip_prompts=skip_prompts,
+            )
+            manager = OllamaManager()
+            ollama_status = manager.get_status()
+
+            if not success and privacy == PrivacyMode.LOCAL_ONLY:
+                # Offer fallback to Connected mode
+                if not skip_prompts:
+                    print("  The download did not complete \u2014 probably a network hiccup.\n")
+                    fallback = input("  [1] Try again  [2] Use connected mode instead: ").strip()
+                    if fallback == "2":
+                        privacy = PrivacyMode.PERFORMANCE
+                        needs_cloud = True
+                    else:
+                        success, models_pulled = self.setup_ollama(
+                            hardware_profile=profile,
+                            model_name=model_name,
+                            skip_prompts=skip_prompts,
+                        )
+
+        # Screen 3B: Cloud setup (if Connected or Smart)
+        if needs_cloud:
+            chosen_provider = self.select_provider(skip_prompts=skip_prompts)
+            self.setup_credentials(skip_prompts=skip_prompts, llm_provider=chosen_provider)
+        elif privacy == PrivacyMode.LOCAL_ONLY:
+            chosen_provider = LLMProvider.OLLAMA
+            self.setup_credentials(skip_prompts=True, llm_provider=LLMProvider.OLLAMA)
+
+        # 5. Grants
         self.setup_grants()
 
         # Build result
@@ -269,6 +423,8 @@ class FirstRunWizard:
             workspace_path=str(self.base_path),
             is_complete=True,
             llm_provider=chosen_provider,
+            ollama_status=ollama_status,
+            models_pulled=models_pulled,
         )
 
         # Persist settings
@@ -278,10 +434,12 @@ class FirstRunWizard:
             "workspace": str(self.base_path),
             "hardware": profile.to_dict() if profile else None,
             "llm_provider": chosen_provider.value,
+            "ollama_models": models_pulled,
+            "embedding_model": EMBEDDING_MODEL if EMBEDDING_MODEL in models_pulled else "",
         }
         (self.base_path / "settings.json").write_text(json.dumps(settings, indent=2))
 
-        # 6. Welcome
+        # Screen 4: Ready
         welcome = self.get_welcome_message(result)
         print(welcome)
 
@@ -300,23 +458,26 @@ class FirstRunWizard:
             hw_label = f"{hw.cpu_model}, {hw.ram_gb:.0f}GB RAM"
 
         mode_labels = {
-            PrivacyMode.LOCAL_ONLY: "Private (Local Only)",
-            PrivacyMode.SMART_ROUTING: "Smart Routing",
-            PrivacyMode.PERFORMANCE: "Connected (Performance)",
+            PrivacyMode.LOCAL_ONLY: "Private \u2014 everything runs on your device",
+            PrivacyMode.SMART_ROUTING: "Smart \u2014 simple tasks local, complex tasks online",
+            PrivacyMode.PERFORMANCE: "Connected \u2014 using your AI account",
         }
         mode_label = mode_labels.get(result.privacy_mode, str(result.privacy_mode))
 
-        model_suffix = "(local)" if result.privacy_mode == PrivacyMode.LOCAL_ONLY else ""
+        model_suffix = "(on device)" if result.privacy_mode == PrivacyMode.LOCAL_ONLY else ""
         model_display = f"{result.model_recommendation} {model_suffix}".strip()
 
         lines = [
             "",
-            "  \u2728 IntentOS is ready.",
+            "  IntentOS is ready.",
             "",
             f"    Hardware:  {hw_label}",
-            f"    Model:     {model_display}",
+            f"    AI:        {model_display}",
             f"    Mode:      {mode_label}",
-            f"    Workspace: {result.workspace_path}",
+        ]
+        if result.models_pulled:
+            lines.append(f"    Ready:     {len(result.models_pulled)} component(s) installed")
+        lines += [
             "",
             '    Just tell IntentOS what to do.',
             '    Try: "Show me my largest files"',

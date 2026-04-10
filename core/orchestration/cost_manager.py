@@ -18,11 +18,24 @@ from typing import Dict, Optional
 
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
     "claude-sonnet-4": {"input": 3.0, "output": 15.0},
+    "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
     "claude-haiku": {"input": 0.25, "output": 1.25},
     "gpt-4o": {"input": 2.50, "output": 10.0},
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
 }
 
-_DEFAULT_PRICING = {"input": 1.0, "output": 3.0}
+# Local models (Ollama) are free
+_LOCAL_PRICING: Dict[str, float] = {"input": 0.0, "output": 0.0}
+
+# Fallback for unknown cloud models
+_DEFAULT_PRICING: Dict[str, float] = {"input": 1.0, "output": 3.0}
+
+# Known local model name prefixes (Ollama)
+_LOCAL_MODEL_PREFIXES = (
+    "llama", "mistral", "phi", "qwen", "gemma", "codellama",
+    "nomic", "deepseek", "vicuna", "orca", "neural-chat",
+    "starcoder", "wizardcoder", "tinyllama", "dolphin",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -191,9 +204,15 @@ class CostManager:
     def estimate_cost(
         self, model: str, estimated_input_tokens: int, estimated_output_tokens: int
     ) -> float:
-        pricing = self._custom_pricing.get(
-            model, MODEL_PRICING.get(model, _DEFAULT_PRICING)
-        )
+        # Check custom pricing first, then known models
+        if model in self._custom_pricing:
+            pricing = self._custom_pricing[model]
+        elif model in MODEL_PRICING:
+            pricing = MODEL_PRICING[model]
+        elif any(model.lower().startswith(p) for p in _LOCAL_MODEL_PREFIXES):
+            pricing = _LOCAL_PRICING
+        else:
+            pricing = _DEFAULT_PRICING
         input_cost = (estimated_input_tokens / 1_000_000) * pricing["input"]
         output_cost = (estimated_output_tokens / 1_000_000) * pricing["output"]
         return input_cost + output_cost

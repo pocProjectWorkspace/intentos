@@ -380,5 +380,170 @@ class TestErrorHandling(_ServerTestBase):
         self.assertIn("error", body)
 
 
+# ===========================================================================
+# 11. Execution bridge tests — API → kernel.process_task()
+# ===========================================================================
+
+class _FakeExecutionResult:
+    """Minimal stand-in for ExecutionResult."""
+    def __init__(self, agent_name, action, status, output=None, error=None):
+        self.agent_name = agent_name
+        self.action = action
+        self.status = status
+        self.output = output or {}
+        self.error = error
+        self.paths_accessed = []
+
+
+class _FakeTaskResult:
+    """Minimal stand-in for TaskResult returned by IntentKernel.process_task()."""
+    def __init__(self, status="success", report="Done.", cost_usd=0.0,
+                 duration_ms=42, intent=None, execution_results=None, error=None):
+        self.task_id = "fake-id"
+        self.status = status
+        self.report = report
+        self.cost_usd = cost_usd
+        self.duration_ms = duration_ms
+        self.intent = intent or {"intent": "file.list", "subtasks": []}
+        self.execution_results = execution_results or []
+        self.error = error
+        self.security_warnings = []
+        self.sop_result = None
+
+
+class _ExecutableKernel:
+    """Fake kernel with a working process_task() for testing the execution bridge."""
+    model = "test-model"
+    settings = {"privacy_mode": "local_only"}
+
+    def __init__(self, result=None, delay=0):
+        self._result = result or _FakeTaskResult()
+        self._delay = delay
+        self.called_with = None
+
+    def process_task(self, user_input):
+        self.called_with = user_input
+        if self._delay:
+            time.sleep(self._delay)
+        return self._result
+
+
+class TestExecutionBridge(unittest.TestCase):
+    """Tests 26-30: API server actually executes tasks via the kernel."""
+
+    def test_26_task_executes_and_completes(self):
+        """Submitting a task to a kernel-backed bridge results in completed status."""
+        fake_result = _FakeTaskResult(
+            status="success",
+            report="Found 5 files.",
+            cost_usd=0.001,
+            duration_ms=150,
+            execution_results=[
+                _FakeExecutionResult(
+                    "file_agent", "list_files", "success",
+                    output={"action_performed": "Listed 5 files", "result": ["a.txt", "b.txt"]},
+                ),
+            ],
+        )
+        kernel = _ExecutableKernel(result=fake_result)
+        bridge = APIBridge(kernel=kernel)
+        bridge.start(host="127.0.0.1", port=17893)
+        time.sleep(0.2)
+
+        try:
+            # Submit
+            status, body, _ = _request("POST", "http://127.0.0.1:17893/api/task",
+                                       {"input": "list my files"})
+            self.assertEqual(status, 200)
+            task_id = body["task_id"]
+
+            # Poll until completed (max 3 seconds)
+            for _ in range(30):
+                time.sleep(0.1)
+                status, body, _ = _request("GET", f"http://127.0.0.1:17893/api/task/{task_id}")
+                if body.get("status") in ("completed", "success", "error"):
+                    break
+
+            # Verify the kernel was called
+            self.assertEqual(kernel.called_with, "list my files")
+
+            # Verify the task completed with results
+            self.assertIn(body["status"], ("completed", "success"))
+            self.assertEqual(body["report"], "Found 5 files.")
+            self.assertIsNotNone(body["result"])
+            self.assertGreater(body["duration_ms"], 0)
+        finally:
+            bridge.stop()
+
+    def test_27_task_error_propagates(self):
+        """A kernel error is reflected in the task status."""
+        fake_result = _FakeTaskResult(
+            status="error",
+            error="Could not understand that instruction",
+        )
+        kernel = _ExecutableKernel(result=fake_result)
+        bridge = APIBridge(kernel=kernel)
+        bridge.start(host="127.0.0.1", port=17894)
+        time.sleep(0.2)
+
+        try:
+            _, body, _ = _request("POST", "http://127.0.0.1:17894/api/task",
+                                  {"input": "do something impossible"})
+            task_id = body["task_id"]
+
+            for _ in range(30):
+                time.sleep(0.1)
+                _, body, _ = _request("GET", f"http://127.0.0.1:17894/api/task/{task_id}")
+                if body.get("status") != "running" and body.get("status") != "accepted":
+                    break
+
+            self.assertEqual(body["status"], "error")
+            self.assertIn("Could not understand", body["error"])
+        finally:
+            bridge.stop()
+
+    def test_28_mock_kernel_skips_execution(self):
+        """With no real kernel (mock), task stays at accepted — no background execution."""
+        bridge = APIBridge(kernel=None)
+        bridge.start(host="127.0.0.1", port=17895)
+        time.sleep(0.2)
+
+        try:
+            _, body, _ = _request("POST", "http://127.0.0.1:17895/api/task",
+                                  {"input": "list files"})
+            task_id = body["task_id"]
+            time.sleep(0.3)
+
+            _, body, _ = _request("GET", f"http://127.0.0.1:17895/api/task/{task_id}")
+            self.assertEqual(body["status"], "accepted")
+        finally:
+            bridge.stop()
+
+    def test_29_task_shows_running_state(self):
+        """While kernel is processing, task status should be 'running'."""
+        # Use a slow kernel to catch the running state
+        fake_result = _FakeTaskResult(status="success", report="Done")
+        kernel = _ExecutableKernel(result=fake_result, delay=1)
+        bridge = APIBridge(kernel=kernel)
+        bridge.start(host="127.0.0.1", port=17896)
+        time.sleep(0.2)
+
+        try:
+            _, body, _ = _request("POST", "http://127.0.0.1:17896/api/task",
+                                  {"input": "slow task"})
+            task_id = body["task_id"]
+            time.sleep(0.2)  # should be running by now
+
+            _, body, _ = _request("GET", f"http://127.0.0.1:17896/api/task/{task_id}")
+            self.assertEqual(body["status"], "running")
+
+            # Wait for completion
+            time.sleep(1.5)
+            _, body, _ = _request("GET", f"http://127.0.0.1:17896/api/task/{task_id}")
+            self.assertIn(body["status"], ("completed", "success"))
+        finally:
+            bridge.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

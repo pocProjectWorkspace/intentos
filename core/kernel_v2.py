@@ -22,7 +22,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 # Ensure project root is on sys.path
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, 'frozen', False):
+    _PROJECT_ROOT = sys._MEIPASS
+else:
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
@@ -66,10 +69,19 @@ The intent object schema:
 Available agents and their actions:
 
 file_agent:
-  Primitives: list_files, find_files, rename_file, move_file, copy_file, \
-create_folder, delete_file, read_file, get_metadata, get_disk_usage.
-  Compound actions: organize_by_type, bulk_rename, cleanup_old_files, \
-deduplicate, sort_by_date, flatten_folders, archive_large_files.
+  - list_files: params {path, extension, recursive} — list files in a folder, filter by extension
+  - find_files: params {path, pattern, extension, size_gt, size_lt, modified_after} — search files by name/type/size
+  - get_metadata: params {path} — file size, dates, type
+  - get_disk_usage: params {path} — disk usage summary, largest files
+  - rename_file: params {path, new_name}
+  - move_file: params {source, destination}
+  - copy_file: params {source, destination}
+  - create_folder: params {path}
+  - delete_file: params {path}
+  - read_file: params {path}
+  - organize_by_type: params {path} — sort files into subfolders by type
+  - bulk_rename: params {path, pattern, replacement}
+  - deduplicate: params {path}
 
 system_agent:
   - get_current_date: params {format}
@@ -91,8 +103,11 @@ image_agent:
   - resize: params {path, width, height}
 
 media_agent:
+  - get_info: params {path} — get media file metadata (duration, codec, bitrate)
   - convert: params {path, format}
   - trim: params {path, start, end}
+  - extract_audio: params {path} — extract audio track from video
+  - compress: params {path, quality}
 
 Rules:
 1. "raw_input" is always the exact text the user typed, unmodified.
@@ -102,7 +117,21 @@ Rules:
 Reference earlier results as "{{1.result}}".
 5. If the instruction is ambiguous, pick the most likely interpretation.
 6. Always return valid JSON. Never return markdown or explanation text.
-7. Use ~ for home directory paths.
+7. Use ~ for home directory paths. The accessible folders are: ~/Downloads, \
+~/Documents, ~/Desktop. If the user says "my machine" or "my computer", \
+search these three folders using one subtask per folder (up to 3 subtasks). \
+If the user says "my downloads" or "downloads folder", use ~/Downloads.
+8. ONLY use actions listed above. Never invent new actions. \
+If the action you want does not exist in the list above, do NOT use it. \
+There is no "count" action — file_agent.find_files already returns the count \
+of matching files along with the file list. \
+To count or find files by type (audio, video, images, etc.), use \
+file_agent.find_files with the extension param set to the category name. \
+Example: extension "audio" finds all audio files, extension "video" finds \
+all video files. You can also use specific extensions like "mp3" or "pdf". \
+To find large files, use file_agent.get_disk_usage. \
+Keep subtasks minimal — usually 1 subtask is enough. Never use 2 subtasks \
+when 1 subtask can do the job.
 """
 
 # ---------------------------------------------------------------------------
@@ -161,7 +190,7 @@ _AGENT_MANIFESTS: Dict[str, Dict[str, Any]] = {
     },
     "media_agent": {
         "version": "0.1.0",
-        "actions": ["convert", "trim"],
+        "actions": ["get_info", "convert", "trim", "extract_audio", "compress"],
         "permissions": ["~/Documents", "~/Downloads", "~/Desktop"],
         "sandbox_policy": "WorkspaceWrite",
     },
@@ -208,6 +237,70 @@ def _ensure_workspace() -> bool:
     if not os.path.exists(audit_file):
         open(audit_file, "a").close()
     return first_run
+
+
+# ---------------------------------------------------------------------------
+# LLM client wrapper for agent planners
+# ---------------------------------------------------------------------------
+
+class _ContentBlock:
+    def __init__(self, text: str):
+        self.text = text
+
+
+class _LLMResponse:
+    def __init__(self, text: str):
+        self.content = [_ContentBlock(text)]
+        self.stop_reason = "end_turn"
+
+
+class _Messages:
+    def __init__(self, llm_service):
+        self._llm = llm_service
+
+    def create(self, model=None, max_tokens=1024, system=None, messages=None, **kw):
+        user_content = ""
+        if messages:
+            user_content = messages[-1].get("content", "")
+
+        # For planning tasks, prefer the cloud backend with proper
+        # system/user separation (critical for structured JSON output).
+        cloud = self._llm._router._cloud_backend
+        if cloud is not None:
+            try:
+                result = cloud.generate(
+                    user_content,
+                    max_tokens=max_tokens,
+                    system=system,
+                )
+                if result and result.text and not result.error:
+                    return _LLMResponse(result.text)
+            except Exception:
+                pass
+
+        # Fallback: concatenate system + user for local models
+        if system:
+            prompt = f"{system}\n\nUser input: {user_content}\n\nRespond with JSON only."
+        else:
+            prompt = user_content
+        result = self._llm.generate(prompt)
+        return _LLMResponse(result.text if result and result.text else "")
+
+
+class _LLMClientWrapper:
+    """Wraps LLMService to look like the Anthropic client API for agent planners."""
+    def __init__(self, llm_service):
+        self.messages = _Messages(llm_service)
+
+
+def _build_llm_client(llm_service) -> Optional[_LLMClientWrapper]:
+    try:
+        backend = llm_service._router._local_backend or llm_service._router._cloud_backend
+        if backend:
+            return _LLMClientWrapper(llm_service)
+    except Exception:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +486,247 @@ class IntentKernel:
 
         return task_result
 
+    # -- File-aware processing ----------------------------------------------
+
+    def process_task_with_file(
+        self, user_input: str, file_path: str, file_name: str, mime: str,
+    ) -> TaskResult:
+        """Process a task with an attached file (document or image).
+
+        For images: sends to Gemma 4 multimodal API for visual analysis.
+        For documents: extracts text, then asks the LLM to respond.
+        """
+        task_id = str(uuid.uuid4())
+        task_start = time.monotonic()
+        cost_before = self.llm.get_total_spent()
+
+        try:
+            is_image = mime.startswith("image/")
+
+            if is_image:
+                response_text = self._process_image(user_input, file_path, file_name)
+            else:
+                response_text = self._process_document(user_input, file_path, file_name, mime)
+
+        except Exception as exc:
+            return TaskResult(
+                task_id=task_id,
+                status="error",
+                error=str(exc),
+                duration_ms=int((time.monotonic() - task_start) * 1000),
+            )
+
+        duration_ms = int((time.monotonic() - task_start) * 1000)
+        cost_after = self.llm.get_total_spent()
+
+        return TaskResult(
+            task_id=task_id,
+            status="success",
+            report=response_text,
+            cost_usd=cost_after - cost_before,
+            duration_ms=duration_ms,
+        )
+
+    def _process_image(self, user_input: str, file_path: str, file_name: str) -> str:
+        """Send an image to the multimodal LLM for analysis."""
+        import base64
+
+        with open(file_path, "rb") as f:
+            image_b64 = base64.b64encode(f.read()).decode("ascii")
+
+        prompt = (
+            f"The user uploaded an image called '{file_name}'. "
+            f"Their request: {user_input}\n\n"
+            "Analyze the image and respond to their request. "
+            "Be concise and helpful. Never use technical jargon."
+        )
+
+        # Try local multimodal first (Gemma 4 supports images)
+        backend = self.llm._router._local_backend
+        if backend is not None and hasattr(backend, "generate"):
+            result = backend.generate(prompt, images=[image_b64])
+            if result.text and not result.error:
+                return result.text.strip()
+
+        # Fallback to cloud (without image — describe what we see)
+        result = self.llm.generate(prompt)
+        if result.text:
+            return result.text.strip()
+
+        return "I received the image but couldn't analyze it. Try again or check your AI backend."
+
+    def _process_document(
+        self, user_input: str, file_path: str, file_name: str, mime: str,
+    ) -> str:
+        """Extract text from a document and send to LLM for analysis."""
+        text = self._extract_text(file_path, file_name, mime)
+
+        if not text.strip():
+            return f"I couldn't extract any text from '{file_name}'. The file may be empty or in an unsupported format."
+
+        # Truncate to ~8000 chars to fit context window
+        max_chars = 8000
+        truncated = len(text) > max_chars
+        doc_text = text[:max_chars]
+
+        prompt = (
+            f"The user uploaded a document called '{file_name}'. "
+            f"Their request: {user_input}\n\n"
+            f"--- DOCUMENT CONTENT ---\n{doc_text}\n--- END ---"
+        )
+        if truncated:
+            prompt += f"\n(Document truncated — showing first {max_chars} of {len(text)} characters)"
+
+        prompt += (
+            "\n\nRespond to the user's request based on the document content. "
+            "Be concise and helpful. Never use technical jargon."
+        )
+
+        result = self.llm.generate(prompt)
+        if result.text:
+            return result.text.strip()
+
+        return f"I read '{file_name}' but couldn't generate a response. Try again."
+
+    @staticmethod
+    def _extract_text(file_path: str, file_name: str, mime: str) -> str:
+        """Extract text content from various document formats."""
+        ext = os.path.splitext(file_name)[1].lower()
+
+        # Plain text formats
+        if mime.startswith("text/") or ext in (".txt", ".csv", ".md", ".json", ".log"):
+            with open(file_path, "r", errors="replace") as f:
+                return f.read()
+
+        # PDF
+        if ext == ".pdf" or mime == "application/pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(file_path)
+                pages = []
+                for page in reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        pages.append(text)
+                return "\n\n".join(pages)
+            except ImportError:
+                return "[PDF reading requires pypdf — already installed]"
+            except Exception as e:
+                return f"[Could not read PDF: {e}]"
+
+        # DOCX
+        if ext == ".docx" or "wordprocessingml" in mime:
+            try:
+                from docx import Document
+                doc = Document(file_path)
+                return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            except ImportError:
+                return "[DOCX reading requires python-docx — already installed]"
+            except Exception as e:
+                return f"[Could not read DOCX: {e}]"
+
+        # XLSX (read as CSV-like text)
+        if ext == ".xlsx" or "spreadsheetml" in mime:
+            try:
+                from openpyxl import load_workbook
+                wb = load_workbook(file_path, read_only=True, data_only=True)
+                lines = []
+                for sheet in wb.sheetnames:
+                    ws = wb[sheet]
+                    lines.append(f"--- Sheet: {sheet} ---")
+                    for row in ws.iter_rows(values_only=True):
+                        cells = [str(c) if c is not None else "" for c in row]
+                        lines.append("\t".join(cells))
+                return "\n".join(lines)
+            except ImportError:
+                return "[XLSX reading requires openpyxl]"
+            except Exception as e:
+                return f"[Could not read XLSX: {e}]"
+
+        return f"[Unsupported document format: {ext}]"
+
+    # -- Conversational chat (no agent routing) -----------------------------
+
+    def process_chat(self, user_input: str, history: list) -> TaskResult:
+        """Process a follow-up message using conversation history + semantic memory.
+
+        This bypasses the agent routing pipeline and sends the full
+        conversation context to the LLM for a direct response. Also queries
+        the RAG system for relevant past conversations and files.
+        """
+        task_id = str(uuid.uuid4())
+        task_start = time.monotonic()
+        cost_before = self.llm.get_total_spent()
+
+        try:
+            # Build conversation context from history
+            conv_lines = []
+            for msg in history[-20:]:  # last 20 messages for context
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "user":
+                    conv_lines.append(f"User: {content}")
+                else:
+                    conv_lines.append(f"Assistant: {content[:800]}")
+
+            context_str = "\n\n".join(conv_lines)
+
+            # Query semantic memory for relevant context
+            memory_context = ""
+            try:
+                assembled = self.context_assembler.build_context(user_input)
+                if assembled and assembled.context_text:
+                    memory_context = assembled.context_text
+            except Exception:
+                pass
+
+            memory_block = ""
+            if memory_context:
+                memory_block = (
+                    f"\n\nRelevant memory from past sessions:\n{memory_context}\n"
+                )
+
+            prompt = (
+                "You are IntentOS, a helpful AI assistant. Continue this conversation "
+                "naturally. Respond directly to the user's latest message.\n\n"
+                "Rules:\n"
+                "- Respond with the content directly in your message\n"
+                "- Do NOT say you will create or save a file — put the content right here\n"
+                "- Use markdown formatting for structure (headings, lists, bold)\n"
+                "- Be concise and helpful\n"
+                "- If asked to draft/write/create something, write it inline\n"
+                "- If the user asks about past work, files, or conversations, use the "
+                "memory context below to answer accurately\n"
+                "- If you find matching files or past conversations in memory, mention "
+                "the specific file names and paths\n\n"
+                f"Conversation so far:\n{context_str}\n"
+                f"{memory_block}\n"
+                f"User: {user_input}\n\n"
+                "Assistant:"
+            )
+
+            result = self.llm.generate(prompt)
+            response_text = result.text.strip() if result and result.text else "I couldn't generate a response."
+
+        except Exception as exc:
+            return TaskResult(
+                task_id=task_id,
+                status="error",
+                error=str(exc),
+                duration_ms=int((time.monotonic() - task_start) * 1000),
+            )
+
+        duration_ms = int((time.monotonic() - task_start) * 1000)
+        cost_after = self.llm.get_total_spent()
+
+        return TaskResult(
+            task_id=task_id,
+            status="success",
+            report=response_text,
+            cost_usd=cost_after - cost_before,
+            duration_ms=duration_ms,
+        )
+
     # -- SOP Phase Handlers -------------------------------------------------
 
     def _phase_parse(self, initial_input: Any, context: Dict) -> Dict:
@@ -409,7 +743,22 @@ class IntentKernel:
 
         result = self.llm.parse_intent(prompt, SYSTEM_PROMPT)
         if result is None:
-            raise ValueError("LLM failed to parse intent — no valid JSON returned")
+            has_local = self.llm._router._local_backend is not None
+            has_cloud = self.llm._router._cloud_backend is not None
+            config = self.llm.get_config()
+            model = config.get("local_model", "unknown")
+
+            if not has_local and not has_cloud:
+                raise ValueError(
+                    "No AI backend is available. Install Ollama "
+                    f"(https://ollama.com/download) and run: ollama pull {model} "
+                    "— or set ANTHROPIC_API_KEY in your .env file."
+                )
+            raise ValueError(
+                f"Could not understand that instruction — the local model ({model}) "
+                f"did not return a usable response. Try rephrasing, or check that "
+                f"Ollama is running and the model is pulled (ollama pull {model})"
+            )
 
         # Ensure raw_input is preserved
         if "raw_input" not in result:
@@ -473,8 +822,9 @@ class IntentKernel:
         return results
 
     def _phase_report(self, results: List[ExecutionResult], context: Dict) -> str:
-        """REPORT: Format results for display."""
-        return self._format_results(results)
+        """REPORT: Generate a conversational response from execution results."""
+        raw_input = context.get("user_input", "")
+        return self._generate_response(raw_input, results)
 
     # -- Error handling -----------------------------------------------------
 
@@ -502,6 +852,12 @@ class IntentKernel:
     def _build_context(self) -> Dict:
         """Build the context dict injected into every agent call."""
         home = os.path.expanduser("~")
+
+        # Create an LLM client wrapper that agents can use for planning.
+        # The file_agent planner calls client.messages.create(model, system, messages)
+        # — we translate that to our backend's generate() method.
+        llm_client = _build_llm_client(self.llm)
+
         return {
             "user": os.getenv("USER", "unknown"),
             "workspace": self._workspace,
@@ -513,6 +869,7 @@ class IntentKernel:
             ],
             "task_id": str(uuid.uuid4()),
             "dry_run": False,
+            "llm_client": llm_client,
         }
 
     # -- Result formatting --------------------------------------------------
@@ -544,6 +901,11 @@ class IntentKernel:
             if r.error:
                 line += f" — {r.error}"
             lines.append(line)
+            # Show the action_performed summary from successful results
+            if r.status == "success" and r.output:
+                performed = r.output.get("action_performed")
+                if performed:
+                    lines.append(f"        → {performed}")
 
         # Summary
         lines.append("")
@@ -551,6 +913,62 @@ class IntentKernel:
                       f"Errors: {error_count} | Skipped: {skipped_count}")
 
         return "\n".join(lines)
+
+    def _generate_response(self, user_input: str, results: List[ExecutionResult]) -> str:
+        """Generate a conversational response from execution results."""
+        # Build a compact summary of what happened
+        result_summaries = []
+        for r in results:
+            summary = {"agent": r.agent_name, "action": r.action, "status": r.status}
+            if r.output:
+                performed = r.output.get("action_performed", "")
+                if performed:
+                    summary["summary"] = performed
+                # Include result data (truncated for large lists)
+                result_data = r.output.get("result")
+                if isinstance(result_data, list):
+                    summary["count"] = len(result_data)
+                    summary["items"] = result_data[:10]  # first 10 for context
+                    if len(result_data) > 10:
+                        summary["truncated"] = True
+                elif result_data is not None:
+                    summary["result"] = result_data
+            if r.error:
+                summary["error"] = r.error
+            result_summaries.append(summary)
+
+        response_prompt = (
+            "You are IntentOS, a friendly AI assistant. The user asked something and "
+            "agents executed tasks to fulfill it. Generate a short, natural, conversational "
+            "response that directly answers the user's question.\n\n"
+            "Rules:\n"
+            "- Be concise and friendly — 1-3 sentences max\n"
+            "- Answer the question directly (e.g., 'You have 189 PDF files in your Downloads folder.')\n"
+            "- If files were found, mention the count and optionally a few notable ones\n"
+            "- If something failed, explain in plain language what went wrong\n"
+            "- Never use technical jargon (no 'agent', 'subtask', 'execution')\n"
+            "- Never use markdown formatting\n"
+            "- Do not mention IntentOS or yourself\n\n"
+            f"User asked: {user_input}\n\n"
+            f"Results: {json.dumps(result_summaries, default=str)}\n\n"
+            "Your response:"
+        )
+
+        try:
+            llm_response = self.llm.generate(response_prompt)
+            if llm_response and llm_response.text:
+                return llm_response.text.strip()
+        except Exception:
+            pass
+
+        # Fallback: use action_performed summaries
+        fallback_parts = []
+        for r in results:
+            if r.output and r.output.get("action_performed"):
+                fallback_parts.append(r.output["action_performed"])
+            elif r.error:
+                fallback_parts.append(r.error)
+        return "  " + " | ".join(fallback_parts) if fallback_parts else self._format_results(results)
 
     # -- CLI subcommand handler ---------------------------------------------
 
@@ -569,8 +987,14 @@ class IntentKernel:
             return self._cmd_credentials()
         elif cmd == "security":
             return self._cmd_security()
+        elif cmd == "speak":
+            text = " ".join(parts[1:]) if len(parts) > 1 else ""
+            return self._cmd_speak(text)
         else:
-            return f"Unknown command: {cmd}\nAvailable: !status, !cost, !history, !credentials, !security"
+            return (
+                f"Unknown command: {cmd}\n"
+                "Available: !status, !cost, !history, !credentials, !security, !speak"
+            )
 
     def _cmd_status(self) -> str:
         """Hardware profile, model, privacy mode, cost summary."""
@@ -664,50 +1088,97 @@ class IntentKernel:
         ]
         return "\n".join(lines)
 
+    def _cmd_speak(self, text: str) -> str:
+        """Speak text aloud using the TTS engine."""
+        if not text:
+            return "Usage: !speak <text to speak>"
+        try:
+            from core.voice.tts import VoiceOutput
+            tts = VoiceOutput()
+            best = tts.get_best_available()
+            result = tts.speak_and_play(text)
+            if result:
+                return f"  Spoke {result.duration_seconds:.1f}s via {result.provider}"
+            return f"  Voice output not available. Best provider: {best.value}"
+        except Exception as e:
+            return f"  Voice output error: {e}"
+
     # -- Display helper -----------------------------------------------------
 
-    def display_result(self, result: TaskResult) -> None:
-        """Print a TaskResult to the terminal."""
-        print()
+    def display_result(self, result: TaskResult, console=None) -> None:
+        """Print a TaskResult to the terminal using rich if available."""
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.text import Text
+            c = console or Console()
+        except ImportError:
+            self._display_result_plain(result)
+            return
+
+        c.print()
+
         if result.status == "blocked":
-            print("=" * 60)
-            print("  BLOCKED")
-            print("=" * 60)
-            if result.error:
-                print(f"  {result.error}")
+            c.print(Panel(
+                result.error or "Blocked by security pipeline",
+                title="Blocked",
+                border_style="red",
+                padding=(0, 2),
+            ))
             for w in result.security_warnings:
-                print(f"  Warning: {w}")
-            print("=" * 60)
+                c.print(f"  [yellow]Warning:[/yellow] {w}")
             return
 
         if result.status == "error":
-            print("=" * 60)
-            print("  ERROR")
-            print("=" * 60)
+            error_text = ""
             sop = result.sop_result
             if sop:
                 for pr in sop.phases:
                     if pr.status == "error":
-                        print(f"  Phase {pr.phase.name}: {pr.error_message}")
+                        error_text += f"{pr.error_message}\n"
             elif result.error:
-                print(f"  {result.error}")
-            print("=" * 60)
+                error_text = result.error
+            c.print(Panel(
+                error_text.strip() or "Something went wrong",
+                title="Error",
+                border_style="red",
+                padding=(0, 2),
+            ))
             return
 
-        # Success
-        intent_label = result.intent.get("intent", "?") if result.intent else "?"
-        print("=" * 60)
-        print("  DONE")
-        print("=" * 60)
-        print(f"  Intent:   {intent_label}")
+        # Success — conversational response
+        report = result.report or "Done."
+        c.print(f"  {report}")
 
-        if result.report:
-            print(result.report)
-
+        # Compact footer
         secs = result.duration_ms / 1000
-        print(f"  Time:     {secs:.1f}s")
-        print(f"  Cost:     ${result.cost_usd:.4f}")
-        print("=" * 60)
+        cost = f"${result.cost_usd:.4f}" if result.cost_usd > 0 else "free (local)"
+        n_err = sum(1 for r in result.execution_results if r.status == "error")
+        footer_parts = [f"{secs:.1f}s", cost]
+        if n_err:
+            footer_parts.append(f"{n_err} error(s)")
+        c.print(f"  [dim]{' · '.join(footer_parts)}[/dim]")
+        c.print()
+
+    def _display_result_plain(self, result: TaskResult) -> None:
+        """Fallback display without rich."""
+        print()
+        if result.status == "blocked":
+            print(f"  BLOCKED: {result.error or 'security pipeline'}")
+            return
+        if result.status == "error":
+            sop = result.sop_result
+            if sop:
+                for pr in sop.phases:
+                    if pr.status == "error":
+                        print(f"  ERROR: {pr.error_message}")
+            elif result.error:
+                print(f"  ERROR: {result.error}")
+            return
+        print(f"  {result.report or 'Done.'}")
+        secs = result.duration_ms / 1000
+        cost = f"${result.cost_usd:.4f}" if result.cost_usd > 0 else "free (local)"
+        print(f"  [{secs:.1f}s · {cost}]")
         print()
 
 
@@ -743,33 +1214,255 @@ def _make_agent_handler(agent_name: str, module_path: str):
 
 
 # ---------------------------------------------------------------------------
-# CLI main loop
+# Interactive backend setup (when no backend is available)
 # ---------------------------------------------------------------------------
 
+def _interactive_setup(kernel: IntentKernel, recommended_model: str) -> IntentKernel:
+    """Ask the user how they want to run AI, then set it up for them."""
+    import getpass
+
+    print()
+    print("  IntentOS needs an AI backend to work. Let's set one up.\n")
+    print("    [1] Private  \u2014 Install local AI on your device (free, offline)")
+    print("    [2] Cloud    \u2014 Use your API key (Anthropic, OpenAI, etc.)")
+    print("    [3] Skip     \u2014 I'll set it up later")
+    print()
+
+    choice = input("  Choose [1/2/3] (default: 1): ").strip()
+
+    if choice == "3":
+        return kernel
+
+    if choice == "2":
+        # Cloud API key setup
+        print()
+        print("  Which provider?")
+        print("    [1] Anthropic (Claude)  \u2014 recommended")
+        print("    [2] OpenAI (GPT)")
+        print()
+        provider_choice = input("  Choose [1/2] (default: 1): ").strip()
+
+        if provider_choice == "2":
+            key_name = "OPENAI_API_KEY"
+            env_name = "OPENAI_API_KEY"
+            print("\n  Get a key at: https://platform.openai.com/api-keys")
+        else:
+            key_name = "ANTHROPIC_API_KEY"
+            env_name = "ANTHROPIC_API_KEY"
+            print("\n  Get a key at: https://console.anthropic.com/settings/keys")
+
+        print()
+        api_key = getpass.getpass("  Paste your API key: ").strip()
+
+        if api_key:
+            # Write to .env
+            env_path = os.path.join(_PROJECT_ROOT, ".env")
+            with open(env_path, "a") as f:
+                f.write(f"\n{env_name}={api_key}\n")
+            os.environ[env_name] = api_key
+            print("  [ok] Key saved\n")
+
+            # Re-initialize the kernel with the new key
+            print("  [..] Connecting...")
+            kernel = IntentKernel()
+            print("  [ok] Ready\n")
+        else:
+            print("  No key entered.\n")
+
+        return kernel
+
+    # Default: choice == "1" or empty — Install Ollama locally
+    print()
+    try:
+        from core.inference.ollama_manager import (
+            OllamaManager,
+            OllamaInstallError,
+        )
+
+        manager = OllamaManager()
+
+        # Step 1: Install Ollama if needed
+        if not manager.is_installed():
+            print("  IntentOS will now install a small local AI engine.")
+            print("  This is a one-time setup (~100 MB download).\n")
+            proceed = input("  Continue? [Y/n]: ").strip()
+            if proceed.lower() == "n":
+                return kernel
+
+            print("  [..] Installing local AI engine...")
+            try:
+                manager.install(silent=True)
+                print("  [ok] Installed\n")
+            except OllamaInstallError as exc:
+                print(f"  [!!] {exc}\n")
+                return kernel
+        else:
+            print("  [ok] Local AI engine found\n")
+
+        # Step 2: Start daemon
+        if not manager.is_running():
+            print("  [..] Starting local AI engine...")
+            if manager.start_daemon():
+                print("  [ok] Running\n")
+            else:
+                print("  [!!] Could not start. Try restarting your computer.\n")
+                return kernel
+
+        # Step 3: Pull models
+        print(f"  [..] Downloading AI model ({recommended_model})...")
+        print("       This takes a few minutes on first run.\n")
+
+        def _show_progress(progress):
+            if progress.status == "complete":
+                print(f"  [ok] {progress.model}")
+            elif progress.total_gb > 0:
+                bar_w = 20
+                filled = int(bar_w * progress.percent / 100)
+                bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
+                print(f"\r  [{bar}] {progress.percent:5.1f}%", end="", flush=True)
+            else:
+                print(f"\r  {progress.status}...", end="", flush=True)
+
+        result = manager.setup_for_local(recommended_model, _show_progress)
+        print()  # newline after progress
+
+        if result["success"]:
+            print(f"  [ok] {len(result['models_pulled'])} component(s) ready\n")
+            # Re-initialize kernel to pick up the new Ollama backend
+            kernel = IntentKernel()
+        else:
+            for err in result["errors"]:
+                print(f"  [!!] {err}")
+            print()
+
+    except Exception as exc:
+        print(f"  Setup error: {exc}\n")
+
+    return kernel
+
+
+# ---------------------------------------------------------------------------
+# CLI main loop — rich + prompt_toolkit
+# ---------------------------------------------------------------------------
+
+# Brand colour
+_BRAND = "rgb(37,99,235)"
+
+_LYNX = """\
+      /\\_____/\\
+     /  o   o  \\
+    ( ==  ^  == )
+     )         (
+    (           )
+   ( (  )   (  ) )
+  (__(__)___(__)__)"""
+
+_HELP_TABLE = [
+    ("!help", "Show this help"),
+    ("!setup", "Set up AI backend (Ollama or API key)"),
+    ("!voice / !v", "Voice input (speak a task)"),
+    ("!speak <text>", "Speak text aloud"),
+    ("!status", "System status"),
+    ("!cost", "Cost breakdown"),
+    ("!history", "Task history"),
+    ("!credentials", "Credential info"),
+    ("!security", "Security stats"),
+    ("exit", "Quit"),
+]
+
+
+def _get_prompt_session():
+    """Create a prompt_toolkit session with history and autocomplete."""
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.history import FileHistory
+        from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+        from prompt_toolkit.completion import WordCompleter
+
+        history_path = os.path.join(
+            os.path.expanduser("~"), ".intentos", "cli_history"
+        )
+        commands = [
+            "!help", "!setup", "!voice", "!v", "!speak", "!status",
+            "!cost", "!history", "!credentials", "!security", "exit", "quit",
+        ]
+        completer = WordCompleter(commands, sentence=True)
+        return PromptSession(
+            history=FileHistory(history_path),
+            auto_suggest=AutoSuggestFromHistory(),
+            completer=completer,
+            complete_while_typing=False,
+        )
+    except ImportError:
+        return None
+
+
 def main() -> None:
+    import argparse
+    import signal
+    import threading
+
+    parser = argparse.ArgumentParser(description="IntentOS Kernel")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run in headless mode (API server only, no REPL)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="API bridge host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=7891,
+                        help="API bridge port (default: 7891)")
+    args = parser.parse_args()
+
     _ensure_workspace()
+
+    # Import rich (graceful fallback to plain print if missing)
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        from rich.status import Status
+        console = Console()
+        HAS_RICH = True
+    except ImportError:
+        console = None
+        HAS_RICH = False
+
+    def cprint(*a, **kw):
+        if console:
+            console.print(*a, **kw)
+        else:
+            print(*a)
+
+    if args.headless:
+        kernel = IntentKernel()
+        try:
+            from core.api.server import APIBridge
+            api = APIBridge(kernel=kernel)
+            api.start(port=args.port)
+            cprint(f"IntentOS headless — API on {args.host}:{args.port}")
+        except Exception as e:
+            cprint(f"API bridge failed: {e}")
+            return
+        shutdown = threading.Event()
+        signal.signal(signal.SIGINT, lambda *_: shutdown.set())
+        signal.signal(signal.SIGTERM, lambda *_: shutdown.set())
+        shutdown.wait()
+        return
 
     # First-run wizard
     try:
         from core.first_run import FirstRunWizard
         wizard = FirstRunWizard()
         if wizard.is_first_run():
-            print()
-            print("  \033[38;2;37;99;235m      /\\_____/\\")
-            print("     /  o   o  \\")
-            print("    ( ==  ^  == )")
-            print("     )         (")
-            print("    (           )")
-            print("   ( (  )   (  ) )")
-            print("  (__(__)___(__)__)\033[0m")
-            print()
-            print("  \033[1mWelcome to IntentOS\033[0m")
-            print("  \033[38;2;107;114;128mYour computer, finally on your side.\033[0m")
-            print()
+            cprint()
+            cprint(f"  [{_BRAND}]{_LYNX}[/{_BRAND}]" if HAS_RICH else _LYNX)
+            cprint()
+            cprint("  [bold]Welcome to IntentOS[/bold]" if HAS_RICH else "  Welcome to IntentOS")
+            cprint("  [dim]Your computer, finally on your side.[/dim]" if HAS_RICH else "  Your computer, finally on your side.")
+            cprint()
             wizard.run(skip_prompts=False)
     except Exception as e:
-        print(f"  Setup note: {e}")
-        print("  Continuing with defaults...\n")
+        cprint(f"  Setup note: {e}")
+        cprint("  Continuing with defaults...\n")
 
     kernel = IntentKernel()
 
@@ -778,36 +1471,78 @@ def main() -> None:
         from core.api.server import APIBridge
         api = APIBridge(kernel=kernel)
         api.start(port=7891)
-        api_status = "API bridge on :7891"
+        api_status = "API on :7891"
     except Exception:
-        api_status = "API bridge offline"
+        api_status = "API offline"
 
     config = kernel.llm.get_config()
     model = config.get('local_model', 'N/A')
     mode = config.get('privacy_mode', 'N/A')
+    has_local = kernel.llm._router._local_backend is not None
+    has_cloud = kernel.llm._router._cloud_backend is not None
 
-    # The Lynx
-    print()
-    print("  \033[38;2;37;99;235m      /\\_____/\\")
-    print("     /  o   o  \\")
-    print("    ( ==  ^  == )")
-    print("     )         (")
-    print("    (           )")
-    print("   ( (  )   (  ) )")
-    print("  (__(__)___(__)__)\033[0m")
-    print()
-    print(f"  \033[1mIntentOS\033[0m v{IntentKernel.VERSION}")
-    print(f"  \033[38;2;107;114;128mLanguage is the interface. The file never leaves.\033[0m")
-    print()
-    print(f"  Model: {model} | Mode: {mode} | {api_status}")
-    print("  Type a task, or '!help' for commands. 'exit' to stop.")
-    print()
+    if has_local:
+        model_display = model
+    elif has_cloud:
+        model_display = config.get('cloud_model', 'cloud')
+    else:
+        model_display = "none"
 
+    # Banner
+    cprint()
+    if HAS_RICH:
+        cprint(f"  [{_BRAND}]{_LYNX}[/{_BRAND}]")
+        cprint()
+        cprint(f"  [bold]IntentOS[/bold] v{IntentKernel.VERSION}")
+        cprint(f"  [dim]Language is the interface. The file never leaves.[/dim]")
+        cprint()
+        # Status line
+        status_parts = []
+        backend_tag = "[green]local[/green]" if has_local else "[yellow]cloud[/yellow]" if has_cloud else "[red]none[/red]"
+        status_parts.append(f"Model: [bold]{model_display}[/bold] ({backend_tag})")
+        status_parts.append(f"Mode: {mode}")
+        status_parts.append(api_status)
+        cprint(f"  {' | '.join(status_parts)}")
+    else:
+        print(f"  {_LYNX}")
+        print(f"\n  IntentOS v{IntentKernel.VERSION}")
+        print(f"  Model: {model_display} | Mode: {mode} | {api_status}")
+
+    if not has_local and not has_cloud:
+        kernel = _interactive_setup(kernel, model)
+        has_local = kernel.llm._router._local_backend is not None
+        has_cloud = kernel.llm._router._cloud_backend is not None
+        if has_local:
+            model_display = model
+        elif has_cloud:
+            model_display = config.get('cloud_model', 'cloud')
+
+        if has_local or has_cloud:
+            cprint(f"\n  Model: {model_display} | Ready")
+        else:
+            cprint("\n  No backend configured. Type '!setup' to try again.")
+    elif not has_local:
+        cprint(f"  [yellow]Local model not available. Using cloud API only.[/yellow]" if HAS_RICH
+               else "  Local model not available. Using cloud API only.")
+
+    cprint(f"\n  Type a task in plain English, or [bold]!help[/bold] for commands.\n" if HAS_RICH
+           else "\n  Type a task in plain English, or !help for commands.\n")
+
+    # Set up prompt_toolkit session (falls back to input() if unavailable)
+    session = _get_prompt_session()
+
+    def get_input() -> str:
+        if session:
+            from prompt_toolkit.formatted_text import HTML
+            return session.prompt(HTML('<b>intentos</b>&gt; ')).strip()
+        return input("intentos> ").strip()
+
+    # REPL loop
     while True:
         try:
-            user_input = input("intentos> ").strip()
+            user_input = get_input()
         except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
+            cprint("\n  Goodbye.")
             break
 
         if not user_input:
@@ -815,57 +1550,75 @@ def main() -> None:
 
         if user_input.lower() in ("exit", "quit"):
             stats = kernel.llm.get_stats()
-            print(
-                f"\nSession summary: {stats['total_calls']} calls, "
-                f"{stats['total_tokens']} tokens, ${stats['total_cost_usd']:.4f}"
-            )
+            cprint()
+            if HAS_RICH:
+                cprint(f"  [dim]Session: {stats['total_calls']} calls, "
+                       f"{stats['total_tokens']} tokens, "
+                       f"${stats['total_cost_usd']:.4f}[/dim]")
+            else:
+                print(f"  Session: {stats['total_calls']} calls, "
+                      f"{stats['total_tokens']} tokens, "
+                      f"${stats['total_cost_usd']:.4f}")
             break
 
         # Handle CLI subcommands
         if user_input.startswith("!"):
             cmd_text = user_input[1:].strip().lower()
 
-            # Voice input
             if cmd_text in ("voice", "v"):
                 try:
                     from core.voice.stt import VoiceInput
                     vi = VoiceInput()
                     if vi.is_available():
-                        print("  Listening... (speak now, 5 seconds)")
+                        cprint("  Listening... (speak now, 5 seconds)")
                         result = vi.listen_and_transcribe(duration=5)
                         if result and result.text:
-                            print(f'  Heard: "{result.text}"')
+                            cprint(f'  Heard: "{result.text}"')
                             user_input = result.text
-                            # Fall through to process_task below
                         else:
-                            print("  Couldn't understand that. Try again or type your task.")
+                            cprint("  Couldn't understand that. Try again or type your task.")
                             continue
                     else:
-                        print("  Voice input not available. Install: pip install SpeechRecognition pyaudio")
+                        cprint("  Voice input not available. Install: pip install SpeechRecognition pyaudio")
                         continue
                 except Exception as e:
-                    print(f"  Voice error: {e}")
+                    cprint(f"  Voice error: {e}")
                     continue
-            elif cmd_text == "help":
-                print(
-                    "Commands:\n"
-                    "  !help         Show this help\n"
-                    "  !voice / !v   Voice input (speak a task)\n"
-                    "  !status       System status\n"
-                    "  !cost         Cost breakdown\n"
-                    "  !history      Task history\n"
-                    "  !credentials  Credential info\n"
-                    "  !security     Security stats\n"
-                    "  exit          Quit"
-                )
-                continue
-            else:
-                output = kernel.handle_command(cmd_text)
-                print(output)
+
+            elif cmd_text == "setup":
+                cfg = kernel.llm.get_config()
+                m = cfg.get('local_model', 'gemma4:e4b')
+                kernel = _interactive_setup(kernel, m)
                 continue
 
-        result = kernel.process_task(user_input)
-        kernel.display_result(result)
+            elif cmd_text == "help":
+                if HAS_RICH:
+                    table = Table(show_header=False, box=None, padding=(0, 2))
+                    table.add_column(style="bold cyan", no_wrap=True)
+                    table.add_column(style="dim")
+                    for cmd, desc in _HELP_TABLE:
+                        table.add_row(cmd, desc)
+                    cprint()
+                    cprint(table)
+                    cprint()
+                else:
+                    for cmd, desc in _HELP_TABLE:
+                        print(f"  {cmd:20s} {desc}")
+                continue
+
+            else:
+                output = kernel.handle_command(cmd_text)
+                cprint(output)
+                continue
+
+        # Execute task with spinner
+        if HAS_RICH:
+            with console.status("[bold blue]Thinking...", spinner="dots"):
+                result = kernel.process_task(user_input)
+        else:
+            result = kernel.process_task(user_input)
+
+        kernel.display_result(result, console=console if HAS_RICH else None)
 
 
 if __name__ == "__main__":

@@ -88,45 +88,45 @@ class HardwareDetector:
         # Less than 4 GB -- smallest viable model
         if ram < 4:
             return ModelRecommendation(
-                model_name="qwen2.5:1.5b",
-                model_size="1.5B",
-                estimated_ram_gb=1.5,
-                reason="Very low RAM; using smallest viable model.",
+                model_name="gemma4:e2b",
+                model_size="2.3B effective",
+                estimated_ram_gb=2.0,
+                reason="Low RAM; Gemma 4 E2B gives native function calling in under 2 GB.",
             )
 
-        # 32 GB+ with NVIDIA GPU -- 70B quantised
+        # 32 GB+ with NVIDIA GPU -- MoE model (only 3.8B active params)
         if ram >= 32 and gpu and gpu.vendor == "nvidia":
             return ModelRecommendation(
-                model_name="llama3.1:70b-instruct-q4_0",
-                model_size="70B 4-bit",
-                estimated_ram_gb=28.0,
-                reason="High RAM with NVIDIA GPU enables large 70B quantised model.",
+                model_name="gemma4:26b-a4b",
+                model_size="26B MoE (3.8B active)",
+                estimated_ram_gb=16.0,
+                reason="High RAM with NVIDIA GPU enables Gemma 4 MoE — GPT-4o class locally.",
             )
 
         # 16 GB+ with any GPU (including Apple Silicon)
         if ram >= 16 and gpu:
             return ModelRecommendation(
-                model_name="llama3.1:8b",
-                model_size="8B",
-                estimated_ram_gb=6.0,
-                reason="16 GB+ RAM with GPU acceleration supports 8B model well.",
+                model_name="gemma4:26b-a4b",
+                model_size="26B MoE (3.8B active)",
+                estimated_ram_gb=16.0,
+                reason="16 GB+ with GPU supports Gemma 4 MoE — GPT-4o class with native tool use.",
             )
 
         # 8 GB+, no GPU (or <16 GB with GPU)
         if ram >= 8:
             return ModelRecommendation(
-                model_name="mistral:7b-instruct-q4_0",
-                model_size="7B 4-bit",
-                estimated_ram_gb=5.0,
-                reason="8 GB RAM suitable for quantised 7B model.",
+                model_name="gemma4:e4b",
+                model_size="4.5B effective",
+                estimated_ram_gb=4.0,
+                reason="8 GB RAM runs Gemma 4 E4B comfortably with native function calling.",
             )
 
         # 4-8 GB, no GPU
         return ModelRecommendation(
-            model_name="phi3:mini",
-            model_size="3.8B",
-            estimated_ram_gb=3.0,
-            reason="Limited RAM; using compact 3.8B model.",
+            model_name="gemma4:e2b",
+            model_size="2.3B effective",
+            estimated_ram_gb=2.0,
+            reason="Limited RAM; Gemma 4 E2B gives best quality-per-byte with tool use support.",
         )
 
     @staticmethod

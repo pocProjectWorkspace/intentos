@@ -29,7 +29,7 @@ class Settings:
     """User-facing configuration stored in settings.json."""
 
     privacy_mode: str = "smart_routing"
-    local_model: str = "phi3:mini"
+    local_model: str = "gemma4:e4b"
     cloud_model: str = "claude-sonnet-4-20250514"
     cloud_provider: str = "anthropic"
     auto_compact_threshold: int = 50
@@ -37,6 +37,8 @@ class Settings:
     theme: str = "dark"
     language: str = "en"
     verbose: bool = False
+    ollama_models: List[str] = field(default_factory=list)
+    embedding_model: str = ""
 
 
 def load_settings(base_path: Path = DEFAULT_BASE_PATH) -> Settings:

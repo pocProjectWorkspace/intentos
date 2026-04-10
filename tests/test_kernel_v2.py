@@ -35,7 +35,7 @@ def kernel():
         mock_llm = MockLLM.return_value
         mock_llm.get_config.return_value = {
             "privacy_mode": "smart_routing",
-            "local_model": "phi3:mini",
+            "local_model": "gemma4:e4b",
             "cloud_model": "claude-sonnet-4-20250514",
             "budget": None,
             "hardware": {
@@ -45,7 +45,7 @@ def kernel():
                 "ram_gb": 16.0,
                 "gpu": {"model": "Apple M1 GPU", "vendor": "apple", "vram_gb": 16.0},
             },
-            "recommended_model": "phi3:mini",
+            "recommended_model": "gemma4:e4b",
         }
         mock_llm.get_stats.return_value = {
             "total_calls": 0,

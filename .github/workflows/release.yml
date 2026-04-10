@@ -1,0 +1,156 @@
+name: Build & Release Installers
+
+# Trigger on version tags: v2.0.0, v2.1.0, etc.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ── macOS Installer (.pkg) ─────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build CLI binary
+        run: |
+          pyinstaller scripts/intentos-cli.spec --distpath build/cli-dist/ --noconfirm
+          chmod +x build/cli-dist/intentos
+
+      - name: Build sidecar binary
+        run: python scripts/build-sidecar.py
+
+      - name: Install frontend dependencies
+        working-directory: ui/desktop
+        run: npm install
+
+      - name: Build Tauri app
+        working-directory: ui/desktop
+        run: npx tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+
+      - name: Build .pkg installer
+        run: bash scripts/build-pkg.sh
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installers
+          path: |
+            build/IntentOS-*-mac-*.pkg
+            build/cli-dist/intentos
+
+  # ── Windows Installer (.exe) ───────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build CLI binary
+        run: pyinstaller scripts/intentos-cli.spec --distpath build/cli-dist/ --noconfirm
+
+      - name: Build sidecar binary
+        run: python scripts/build-sidecar.py
+
+      - name: Install frontend dependencies
+        working-directory: ui/desktop
+        run: npm install
+
+      - name: Build Tauri app
+        working-directory: ui/desktop
+        run: npx tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: |
+            ui/desktop/src-tauri/target/release/bundle/nsis/*.exe
+            build/cli-dist/intentos.exe
+
+  # ── Create GitHub Release ──────────────────────────────────
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-installers
+          path: artifacts/macos
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installers
+          path: artifacts/windows
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: IntentOS ${{ github.ref_name }}
+          body: |
+            ## IntentOS ${{ github.ref_name }}
+
+            **Download:**
+            - **macOS** — `IntentOS-mac.pkg` (Apple Silicon & Intel, macOS 12+)
+            - **Windows** — `IntentOS-Setup.exe` (64-bit, Windows 10+)
+
+            **What's included:**
+            - Desktop app (GUI)
+            - Command line tool (`intentos`)
+            - Installer handles Ollama setup for local AI
+
+            **First launch:**
+            Open the app and choose Private (on-device) or Connected (cloud API).
+            IntentOS handles the rest.
+          files: |
+            artifacts/macos/**/*
+            artifacts/windows/**/*
+          draft: false
+          prerelease: false
