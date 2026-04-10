@@ -27,7 +27,6 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
   const [stage, setStage] = useState<SetupStage>('checking');
   const [progress, setProgress] = useState<PullProgress | null>(null);
   const [error, setError] = useState('');
-  const [, setOllamaStatus] = useState<null>(null);
 
   useEffect(() => {
     if (!isTauri()) {
@@ -61,8 +60,6 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
 
         const status = await getBackendStatus();
         if (!cancelled) {
-          setOllamaStatus(status.ollama);
-
           if (status.backend_alive && status.ollama.models.length > 0) {
             // Already set up
             onComplete();
