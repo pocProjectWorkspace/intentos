@@ -1,4 +1,4 @@
-import { XCircle, Loader2, Zap } from 'lucide-react';
+import { Loader2, Zap } from 'lucide-react';
 import { useEffect, useRef } from 'react';
 import Markdown from 'react-markdown';
 import type { Task, ChatMessage } from '../types';

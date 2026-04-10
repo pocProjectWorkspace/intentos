@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { isTauri } from '../lib/platform';
-import type { PullProgress, OllamaStatus } from '../lib/tauri-api';
+import type { PullProgress } from '../lib/tauri-api';
 
 interface SetupWizardProps {
   onComplete: () => void;
@@ -27,7 +27,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
   const [stage, setStage] = useState<SetupStage>('checking');
   const [progress, setProgress] = useState<PullProgress | null>(null);
   const [error, setError] = useState('');
-  const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
+  const [, setOllamaStatus] = useState<null>(null);
 
   useEffect(() => {
     if (!isTauri()) {
@@ -91,7 +91,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
   async function handleSetup() {
     try {
       setStage('installing');
-      const { setupOllama, getPlatformInfo } = await import('../lib/tauri-api');
+      const { setupOllama } = await import('../lib/tauri-api');
 
       // For now, use a default model. The backend will detect hardware.
       await setupOllama('llama3.1:8b');

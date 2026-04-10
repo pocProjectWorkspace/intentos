@@ -1,4 +1,4 @@
-import { Clock, CheckCircle2, MessageSquare, Plus, Trash2 } from 'lucide-react';
+import { MessageSquare, Plus, Trash2 } from 'lucide-react';
 import type { Task, ChatSession } from '../types';
 
 interface TaskHistoryProps {
