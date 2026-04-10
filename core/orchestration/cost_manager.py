@@ -8,6 +8,7 @@ Inspired by MetaGPT's CostManager pattern. Provides:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -138,6 +139,14 @@ class CostManager:
         self._by_task: Dict[str, TokenUsage] = {}
         self._custom_pricing: Dict[str, Dict[str, float]] = {}
 
+        # Enterprise spending limits (set by policy engine)
+        self._daily_limit: Optional[float] = None
+        self._monthly_limit: Optional[float] = None
+        self._daily_spent: float = 0.0
+        self._monthly_spent: float = 0.0
+        self._current_day: str = time.strftime("%Y-%m-%d")
+        self._current_month: str = time.strftime("%Y-%m")
+
     # -- Budget management --------------------------------------------------
 
     def check_budget(self, estimated_cost: float) -> bool:
@@ -161,6 +170,38 @@ class CostManager:
             return 0.0 if self._total_spent == 0.0 else 1.0
         return self._total_spent / self._budget
 
+    # -- Enterprise spending limits -----------------------------------------
+
+    def set_spending_limits(
+        self,
+        daily_limit: Optional[float] = None,
+        monthly_limit: Optional[float] = None,
+    ) -> None:
+        """Set daily/monthly spending limits (from enterprise policy)."""
+        self._daily_limit = daily_limit
+        self._monthly_limit = monthly_limit
+
+    @property
+    def daily_spent(self) -> float:
+        self._rollover_if_needed()
+        return self._daily_spent
+
+    @property
+    def monthly_spent(self) -> float:
+        self._rollover_if_needed()
+        return self._monthly_spent
+
+    def _rollover_if_needed(self) -> None:
+        """Reset daily/monthly counters when the period changes."""
+        today = time.strftime("%Y-%m-%d")
+        month = time.strftime("%Y-%m")
+        if today != self._current_day:
+            self._daily_spent = 0.0
+            self._current_day = today
+        if month != self._current_month:
+            self._monthly_spent = 0.0
+            self._current_month = month
+
     # -- Recording usage ----------------------------------------------------
 
     def record_usage(
@@ -180,7 +221,18 @@ class CostManager:
             if self._total_spent + cost > self._budget:
                 raise BudgetExceededException(cost, remaining, self._total_spent)
 
+        # Enterprise spending limit enforcement
+        self._rollover_if_needed()
+        if self._daily_limit is not None and self._daily_spent + cost > self._daily_limit:
+            raise BudgetExceededException(cost, self._daily_limit - self._daily_spent, self._daily_spent)
+        if self._monthly_limit is not None and self._monthly_spent + cost > self._monthly_limit:
+            raise BudgetExceededException(cost, self._monthly_limit - self._monthly_spent, self._monthly_spent)
+
         usage = TokenUsage(input_tokens, output_tokens, cost, 1)
+
+        # Enterprise daily/monthly tracking
+        self._daily_spent += cost
+        self._monthly_spent += cost
 
         # Totals
         self._total_spent += cost

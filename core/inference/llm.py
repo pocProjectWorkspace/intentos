@@ -7,10 +7,12 @@ the kernel calls for all LLM operations.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 from core.inference.hardware import HardwareDetector, HardwareProfile, ModelRecommendation
 from core.inference.providers import (
@@ -195,6 +197,12 @@ class LLMService:
         # Store privacy mode for config
         self._privacy_mode = privacy_mode
 
+        # Inference interceptor — ring buffer + JSONL log
+        self._inference_log: Deque[Dict] = deque(maxlen=1000)
+        self._inference_log_path = os.path.join(
+            os.path.expanduser("~"), ".intentos", "logs", "inference.jsonl"
+        )
+
         # Auto-setup backends
         self._setup_backends(credential_provider)
 
@@ -301,6 +309,23 @@ class LLMService:
             self._calls_cloud += 1
         self._total_latency_ms += result.latency_ms
 
+        # Inference interceptor — log every call (never log prompt content)
+        record = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "provider": result.backend,
+            "model": result.model or "unknown",
+            "task_type": task_type,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "cost_usd": round(cost, 6),
+            "latency_ms": result.latency_ms,
+            "privacy_mode": self._privacy_mode.value
+                if hasattr(self._privacy_mode, "value")
+                else str(self._privacy_mode),
+        }
+        self._inference_log.append(record)
+        self._flush_inference_record(record)
+
         return LLMResponse(
             text=result.text,
             model=result.model,
@@ -332,6 +357,31 @@ class LLMService:
 
     def get_remaining_budget(self) -> Optional[float]:
         return self._cost_manager.remaining_budget
+
+    # -- Inference log (enterprise ledger) ----------------------------------
+
+    def _flush_inference_record(self, record: Dict) -> None:
+        """Append a single inference record to the JSONL log on disk."""
+        try:
+            os.makedirs(os.path.dirname(self._inference_log_path), exist_ok=True)
+            with open(self._inference_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except Exception:
+            pass  # never crash on log write failure
+
+    def get_inference_log(self, last_n: int = 100) -> List[Dict]:
+        """Return the most recent *last_n* inference records."""
+        items = list(self._inference_log)
+        return items[-last_n:]
+
+    def get_inference_stats(self) -> Dict:
+        """Return aggregate inference stats for telemetry."""
+        return {
+            "calls_local": self._calls_local,
+            "calls_cloud": self._calls_cloud,
+            "total_calls": self._calls_local + self._calls_cloud,
+            "total_latency_ms": round(self._total_latency_ms, 1),
+        }
 
     # -- Intent parsing -----------------------------------------------------
 

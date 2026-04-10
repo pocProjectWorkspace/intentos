@@ -321,9 +321,23 @@ class IntentKernel:
         _ensure_workspace()
         self._workspace = os.path.join(os.path.expanduser("~"), ".intentos", "workspace")
 
+        # Configuration (includes enterprise policy)
+        from core.config import IntentOSConfig
+        self._config = IntentOSConfig()
+
         # Security
         self.security = SecurityPipeline(strict_mode=True)
         self.credentials = CredentialProvider()
+
+        # Enterprise policy — override privacy mode if managed
+        policy = self._config.policy
+        if policy is not None and policy.is_managed:
+            policy_privacy = policy.get_compliance_status().get("privacy_mode")
+            if policy_privacy and policy.get_compliance_status().get("privacy_mode_locked"):
+                try:
+                    privacy_mode = PrivacyMode(policy_privacy)
+                except ValueError:
+                    pass
 
         # Inference
         self.llm = LLMService(
@@ -331,6 +345,15 @@ class IntentKernel:
             credential_provider=self.credentials,
             budget=budget,
         )
+
+        # Wire enterprise spending limits
+        if policy is not None and policy.is_managed:
+            limits = policy.get_spending_limits()
+            if limits:
+                self.llm._cost_manager.set_spending_limits(
+                    daily_limit=limits.get("daily_limit_usd"),
+                    monthly_limit=limits.get("monthly_limit_usd"),
+                )
 
         # Orchestration
         self.scheduler = AgentScheduler(workspace=self._workspace)
@@ -343,6 +366,25 @@ class IntentKernel:
 
         # Task history (in-memory for the session)
         self._task_history: List[TaskResult] = []
+
+        # Enterprise telemetry reporter (starts if policy has telemetry config)
+        self._telemetry = None
+        if policy is not None and policy.is_managed:
+            tel_config = policy.get_telemetry_config()
+            if tel_config and tel_config.get("console_url"):
+                try:
+                    from core.enterprise.telemetry import TelemetryReporter
+                    self._telemetry = TelemetryReporter(
+                        console_url=tel_config["console_url"],
+                        device_token=tel_config.get("device_token", ""),
+                        interval=tel_config.get("heartbeat_interval_seconds", 300),
+                        policy_engine=policy,
+                        llm_service=self.llm,
+                        security_pipeline=self.security,
+                    )
+                    self._telemetry.start()
+                except Exception:
+                    pass
 
         # Register all agents
         self._register_agents()
@@ -776,11 +818,16 @@ class IntentKernel:
         return {"intent": intent, "subtasks": subtasks, "mode": mode}
 
     def _phase_validate(self, plan: Dict, context: Dict) -> Dict:
-        """VALIDATE: Check all agents exist, permissions valid."""
+        """VALIDATE: Check all agents exist, permissions valid, policy allows."""
+        policy = self._config.policy if hasattr(self, "_config") else None
         for subtask in plan["subtasks"]:
             agent = subtask.get("agent")
             if not self.scheduler.is_registered(agent):
                 raise ValueError(f"Agent '{agent}' is not available")
+            if policy is not None and not policy.check_agent(agent):
+                raise ValueError(
+                    f"Agent '{agent}' is blocked by organization policy"
+                )
         return plan
 
     def _phase_preview(self, plan: Dict, context: Dict) -> Dict:

@@ -177,6 +177,11 @@ class APIBridge:
             ("POST",   r"/api/upload$",                 self.handle_upload_file),
             ("POST",   r"/api/voice/listen$",            self.handle_voice_listen),
             ("POST",   r"/api/voice/speak$",             self.handle_voice_speak),
+            # Enterprise endpoints
+            ("GET",    r"/api/policy$",                  self.handle_get_policy),
+            ("GET",    r"/api/inference-log$",            self.handle_get_inference_log),
+            ("GET",    r"/api/telemetry-status$",         self.handle_get_telemetry_status),
+            ("POST",   r"/api/telemetry/send-now$",       self.handle_telemetry_send_now),
         ]
 
     def _match_route(self, method: str, path: str) -> Optional[Tuple[Callable, dict]]:
@@ -1024,6 +1029,48 @@ class APIBridge:
         return 503, {
             "error": f"Voice output not available. Best provider: {best.value}",
         }
+
+    # -- Enterprise endpoints -----------------------------------------------
+
+    def handle_get_policy(self, req: dict) -> Tuple[int, dict]:
+        """GET /api/policy — return enterprise policy compliance status."""
+        if self._kernel is None:
+            return 200, {"managed": False}
+        config = getattr(self._kernel, "_config", None)
+        if config is None or not hasattr(config, "policy") or config.policy is None:
+            return 200, {"managed": False}
+        return 200, config.policy.get_compliance_status()
+
+    def handle_get_inference_log(self, req: dict) -> Tuple[int, dict]:
+        """GET /api/inference-log — return recent inference records."""
+        if self._kernel is None:
+            return 200, {"records": []}
+        llm = getattr(self._kernel, "llm", None)
+        if llm is None or not hasattr(llm, "get_inference_log"):
+            return 200, {"records": []}
+        params = req.get("query_params", {})
+        last_n = int(params.get("limit", 100))
+        records = llm.get_inference_log(last_n=last_n)
+        return 200, {"records": records, "count": len(records)}
+
+    def handle_get_telemetry_status(self, req: dict) -> Tuple[int, dict]:
+        """GET /api/telemetry-status — return telemetry reporter state."""
+        if self._kernel is None:
+            return 200, {"running": False, "reason": "no kernel"}
+        telemetry = getattr(self._kernel, "_telemetry", None)
+        if telemetry is None:
+            return 200, {"running": False, "reason": "not configured"}
+        return 200, telemetry.get_status()
+
+    def handle_telemetry_send_now(self, req: dict) -> Tuple[int, dict]:
+        """POST /api/telemetry/send-now — force an immediate heartbeat."""
+        if self._kernel is None:
+            return 503, {"error": "Kernel not available"}
+        telemetry = getattr(self._kernel, "_telemetry", None)
+        if telemetry is None:
+            return 404, {"error": "Telemetry not configured (no enterprise policy)"}
+        ok = telemetry.send_now()
+        return 200, {"sent": ok, "status": telemetry.get_status()}
 
 
 # ---------------------------------------------------------------------------

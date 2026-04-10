@@ -68,8 +68,23 @@ def save_settings(settings: Settings, base_path: Path = DEFAULT_BASE_PATH) -> No
     os.chmod(settings_file, 0o644)
 
 
-def update_settings(updates: dict, base_path: Path = DEFAULT_BASE_PATH) -> Settings:
-    """Merge *updates* into the existing settings and persist."""
+def update_settings(
+    updates: dict,
+    base_path: Path = DEFAULT_BASE_PATH,
+    policy: Optional[Any] = None,
+) -> Settings:
+    """Merge *updates* into the existing settings and persist.
+
+    When an enterprise *policy* is active, locked fields are rejected.
+    """
+    # Enforce policy locks
+    if policy is not None and hasattr(policy, "is_managed") and policy.is_managed:
+        if "privacy_mode" in updates and not policy.check_privacy_mode(updates["privacy_mode"]):
+            from core.enterprise.policy import PolicyViolationError
+            raise PolicyViolationError(
+                "privacy_mode is locked by organization policy"
+            )
+
     settings = load_settings(base_path)
     for key, value in updates.items():
         if hasattr(settings, key):
@@ -287,7 +302,7 @@ class WorkspaceManager:
 # ---------------------------------------------------------------------------
 
 class IntentOSConfig:
-    """Convenience wrapper that bundles workspace, settings, and grants."""
+    """Convenience wrapper that bundles workspace, settings, grants, and policy."""
 
     def __init__(self, base_path: Path = DEFAULT_BASE_PATH):
         self._base = base_path
@@ -297,9 +312,21 @@ class IntentOSConfig:
         self.settings: Settings = load_settings(base_path)
         self.grants: Grants = load_grants(base_path)
 
+        # Enterprise policy (gracefully absent for consumer/SMB)
+        try:
+            from core.enterprise.policy import PolicyEngine
+            self.policy: Optional["PolicyEngine"] = PolicyEngine(base_path)
+        except Exception:
+            self.policy = None
+
     @property
     def is_first_run(self) -> bool:
         return self._first_run
+
+    @property
+    def is_managed(self) -> bool:
+        """True when an enterprise policy is active."""
+        return self.policy is not None and self.policy.is_managed
 
     def save_all(self) -> None:
         """Persist both settings and grants."""
