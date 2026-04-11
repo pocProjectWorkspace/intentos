@@ -19,6 +19,31 @@ from urllib.parse import urlparse, parse_qs
 
 DB_PATH = Path.home() / ".intentos" / "console_demo.db"
 
+LICENSE_SECRET = b"intentos-license-signing-key-v1"
+
+
+def generate_license_key(tier: str, year: str, max_seats: int, org_id: str) -> str:
+    """Generate a verifiable license key."""
+    import hmac as _hmac
+    payload = f"{tier}-{year}-{max_seats}-{org_id}"
+    h = _hmac.new(LICENSE_SECRET, payload.encode(), hashlib.sha256).hexdigest()[:8].upper()
+    tier_code = {"free": "FREE", "pro": "PRO", "enterprise": "ENT"}.get(tier, "PRO")
+    return f"INTENT-{tier_code}-{year}-{h}"
+
+
+def validate_license_key(key: str) -> bool:
+    """Check if a license key has valid format and structure."""
+    parts = key.split("-")
+    if len(parts) != 4 or parts[0] != "INTENT":
+        return False
+    if parts[1] not in ("FREE", "PRO", "ENT"):
+        return False
+    if not parts[2].isdigit() or len(parts[2]) != 4:
+        return False
+    if len(parts[3]) != 8:
+        return False
+    return True
+
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
@@ -304,9 +329,13 @@ def _seed_licenses(conn: sqlite3.Connection):
     if conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0] > 0:
         return
     now = datetime.utcnow()
+    # Generate a real verifiable license key
+    key = generate_license_key("enterprise", "2026", 500, "demo-org")
+    # Seat count reflects actual device count in the database
+    device_count = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
     conn.execute(
         "INSERT INTO licenses VALUES (?,?,?,?,?,?,?,?)",
-        (str(uuid.uuid4()), "INTENT-ENT-2026-7X4F", "enterprise", 500, 47,
+        (str(uuid.uuid4()), key, "enterprise", 500, device_count,
          "2027-12-31T23:59:59", (now - timedelta(days=90)).isoformat(), "active"))
     conn.commit()
 
@@ -373,13 +402,33 @@ def api_fleet_overview(conn: sqlite3.Connection) -> dict:
         if d["policy_compliant"]:
             compliant += 1
         devices.append(d)
-    return {
+    # Fetch active license info
+    lic = conn.execute(
+        "SELECT * FROM licenses WHERE status='active' ORDER BY activated_at DESC LIMIT 1"
+    ).fetchone()
+    license_info = None
+    if lic:
+        now_str = datetime.utcnow().isoformat()
+        lic_status = "active" if (lic["expires_at"] or "") >= now_str else "expired"
+        license_info = {
+            "key": lic["license_key"],
+            "tier": lic["tier"],
+            "seats_used": lic["used_seats"] or 0,
+            "seats_max": lic["max_seats"] or 0,
+            "expires_at": lic["expires_at"],
+            "status": lic_status
+        }
+
+    result = {
         "total_devices": len(rows), "online": online,
         "offline": len(rows) - online, "compliant": compliant,
         "non_compliant": len(rows) - compliant,
         "total_cost_usd": round(total_cost, 2),
         "devices": devices
     }
+    if license_info:
+        result["license"] = license_info
+    return result
 
 
 def api_ai_usage(conn: sqlite3.Connection) -> dict:
@@ -432,6 +481,26 @@ def api_compliance(conn: sqlite3.Connection) -> dict:
 def api_heartbeat(body: dict, headers: dict, conn: sqlite3.Connection) -> dict:
     device_id = headers.get("x-device-token", body.get("device_id", str(uuid.uuid4())))
     now = datetime.utcnow().isoformat()
+
+    # --- License checks: expiry and seat limit ---
+    lic = conn.execute(
+        "SELECT * FROM licenses WHERE status='active' ORDER BY activated_at DESC LIMIT 1"
+    ).fetchone()
+    if lic:
+        # Check expiry
+        expires_at = lic["expires_at"] or ""
+        if expires_at and expires_at < now:
+            return {"status": "error", "message": "License expired."}
+        # Check if this is a NEW device (not seen before)
+        existing = conn.execute("SELECT id FROM devices WHERE id=?", (device_id,)).fetchone()
+        if not existing:
+            used = lic["used_seats"] or 0
+            max_s = lic["max_seats"] or 0
+            if used >= max_s:
+                return {"status": "error", "message": "Seat limit exceeded. Contact your IT administrator."}
+            # Increment used_seats for this new device
+            conn.execute("UPDATE licenses SET used_seats=? WHERE id=?", (used + 1, lic["id"]))
+
     conn.execute("""INSERT INTO devices (id,hostname,os,status,intentos_version,privacy_mode,
         policy_compliant,last_heartbeat_at,created_at,cloud_access,assigned_api_keys)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)
@@ -732,21 +801,39 @@ def verify_token(headers: dict, conn: sqlite3.Connection) -> dict:
 
 
 def api_licenses_list(conn: sqlite3.Connection) -> list:
-    return [dict(r) for r in conn.execute("SELECT * FROM licenses ORDER BY activated_at DESC").fetchall()]
+    device_count = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+    licenses = []
+    for r in conn.execute("SELECT * FROM licenses ORDER BY activated_at DESC").fetchall():
+        lic = dict(r)
+        # For the active license, reflect actual device count as used_seats
+        if lic.get("status") == "active":
+            lic["used_seats"] = device_count
+        licenses.append(lic)
+    return licenses
 
 
 def api_licenses_activate(body: dict, conn: sqlite3.Connection) -> dict:
     key = body.get("license_key", "")
-    if not re.match(r"^INTENT-[A-Z]{3}-\d{4}-[A-Z0-9]{4}$", key):
-        return {"error": "Invalid license key format. Expected: INTENT-XXX-XXXX-XXXX"}
+    org_name = body.get("org_name", "Unknown Org")
+    if not validate_license_key(key):
+        return {"error": "Invalid license key format. Expected: INTENT-XXX-XXXX-XXXXXXXX"}
+    # Determine tier and seat allocation from key
+    parts = key.split("-")
+    tier_code = parts[1]
+    tier_map = {"FREE": ("free", 5), "PRO": ("pro", 50), "ENT": ("enterprise", 500)}
+    tier, max_seats = tier_map.get(tier_code, ("pro", 50))
     now = datetime.utcnow()
     lid = str(uuid.uuid4())
+    expires_at = (now + timedelta(days=365)).isoformat()
     conn.execute(
         "INSERT INTO licenses VALUES (?,?,?,?,?,?,?,?)",
-        (lid, key, "enterprise", 500, 0,
-         (now + timedelta(days=365)).isoformat(), now.isoformat(), "active"))
+        (lid, key, tier, max_seats, 0, expires_at, now.isoformat(), "active"))
     conn.commit()
-    return {"id": lid, "status": "activated", "license_key": key}
+    return {
+        "id": lid, "status": "activated", "license_key": key,
+        "tier": tier, "max_seats": max_seats, "expires_at": expires_at,
+        "org_name": org_name
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2136,7 +2223,7 @@ async function renderLicenses(app) {
     <div style="display:flex;gap:12px;align-items:end;margin-top:12px">
       <div class="form-group" style="flex:1;margin-bottom:0">
         <label>License Key</label>
-        <input type="text" id="license-key-input" placeholder="INTENT-XXX-XXXX-XXXX">
+        <input type="text" id="license-key-input" placeholder="INTENT-ENT-2026-XXXXXXXX">
       </div>
       <button class="btn primary" onclick="activateLicense()">Activate</button>
     </div>
@@ -2294,7 +2381,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._check_auth(path, conn):
                 return
             if path == "/api/v1/telemetry/heartbeat":
-                return self._json(200, api_heartbeat(body, hdrs, conn))
+                result = api_heartbeat(body, hdrs, conn)
+                if result.get("status") == "error":
+                    return self._json(403, result)
+                return self._json(200, result)
             if path == "/api/v1/licenses/activate":
                 result = api_licenses_activate(body, conn)
                 if result.get("error"):

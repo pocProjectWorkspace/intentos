@@ -221,13 +221,36 @@ class TelemetryReporter:
             return True
         except urllib.error.HTTPError as e:
             logger.debug("Telemetry POST failed: HTTP %d", e.code)
+            try:
+                err_data = json.loads(e.read())
+                self._handle_response(err_data)
+            except Exception:
+                pass
             return False
         except Exception:
             logger.debug("Telemetry POST failed", exc_info=True)
             return False
 
     def _handle_response(self, data: Dict) -> None:
-        """Process Console response — may contain a policy update."""
+        """Process Console response — may contain a policy update or error."""
+        # Detect license/seat errors from Console
+        status = data.get("status", "")
+        message = data.get("message", "")
+        if status == "error":
+            if "Seat limit exceeded" in message:
+                logger.warning(
+                    "Console rejected heartbeat: seat limit exceeded — "
+                    "contact your IT administrator to add more seats"
+                )
+            elif "License expired" in message:
+                logger.warning(
+                    "Console rejected heartbeat: license expired — "
+                    "contact your IT administrator to renew the license"
+                )
+            else:
+                logger.warning("Console rejected heartbeat: %s", message)
+            return
+
         policy_update = data.get("policy_update")
         if policy_update is None:
             return

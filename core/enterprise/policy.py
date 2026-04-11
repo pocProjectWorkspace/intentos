@@ -206,7 +206,11 @@ class PolicyEngine:
         return True
 
     def check_license(self) -> bool:
-        """Return True if no license section (unmanaged/consumer), or if the license has not expired."""
+        """Return True if no license section (unmanaged/consumer), or if the license has not expired.
+
+        Strictly returns False when a license section exists and the
+        ``expires_at`` date is in the past.
+        """
         if not self._managed or self._policy is None:
             return True
         license_info = self._policy.get("license")
@@ -217,10 +221,22 @@ class PolicyEngine:
             return True
         try:
             expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            return datetime.now(timezone.utc) < expiry
-        except (ValueError, TypeError):
-            logger.warning("Invalid expires_at in license section — treating as valid")
+            if datetime.now(timezone.utc) >= expiry:
+                logger.warning("Enterprise license expired (expires_at=%s)", expires_at)
+                return False
             return True
+        except (ValueError, TypeError):
+            logger.warning("Invalid expires_at in license section — treating as expired")
+            return False
+
+    def get_license_tier(self) -> str:
+        """Return the license tier string, or 'free' if no license is present."""
+        if not self._managed or self._policy is None:
+            return "free"
+        license_info = self._policy.get("license")
+        if not license_info:
+            return "free"
+        return license_info.get("tier", "free")
 
     # -- accessors -----------------------------------------------------------
 
