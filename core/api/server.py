@@ -32,6 +32,7 @@ import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 
@@ -182,6 +183,14 @@ class APIBridge:
             ("GET",    r"/api/inference-log$",            self.handle_get_inference_log),
             ("GET",    r"/api/telemetry-status$",         self.handle_get_telemetry_status),
             ("POST",   r"/api/telemetry/send-now$",       self.handle_telemetry_send_now),
+            ("GET",    r"/api/siem-export$",                self.handle_siem_export),
+            # Telemetry consent
+            ("GET",    r"/api/telemetry-consent$",        self.handle_get_telemetry_consent),
+            ("POST",   r"/api/telemetry-consent$",        self.handle_set_telemetry_consent),
+            # Backup & restore
+            ("POST",   r"/api/backup$",                   self.handle_create_backup),
+            ("GET",    r"/api/backups$",                   self.handle_list_backups),
+            ("GET",    r"/api/data-summary$",              self.handle_data_summary),
         ]
 
     def _match_route(self, method: str, path: str) -> Optional[Tuple[Callable, dict]]:
@@ -1071,6 +1080,91 @@ class APIBridge:
             return 404, {"error": "Telemetry not configured (no enterprise policy)"}
         ok = telemetry.send_now()
         return 200, {"sent": ok, "status": telemetry.get_status()}
+
+    def handle_siem_export(self, req: dict) -> Tuple[int, dict]:
+        """GET /api/siem-export — export audit data in SIEM format."""
+        try:
+            from core.enterprise.siem_export import SIEMExporter
+            exporter = SIEMExporter()
+            params = req.get("query", {})
+            fmt = params.get("format", "splunk")
+            events = exporter._collect_local_events()
+            if fmt == "splunk":
+                formatted = exporter.export_splunk_hec(events)
+            elif fmt == "sentinel":
+                formatted = exporter.export_sentinel(events)
+            else:
+                formatted = events
+            filepath = exporter.export_to_file(fmt)
+            return 200, {"format": fmt, "event_count": len(formatted), "events": formatted, "exported_to": filepath}
+        except Exception as e:
+            return 200, {"format": "none", "event_count": 0, "events": [], "error": str(e)}
+
+    # -- Telemetry consent --------------------------------------------------
+
+    def handle_get_telemetry_consent(self, req: dict) -> Tuple[int, dict]:
+        """GET /api/telemetry-consent — return consent status."""
+        try:
+            from core.enterprise.telemetry import TelemetryReporter
+            status = TelemetryReporter.get_consent_status()
+            # Check if managed via policy
+            policy = getattr(self._kernel, "_policy_engine", None)
+            if policy and hasattr(policy, "is_managed") and policy.is_managed:
+                status["managed"] = True
+            return 200, status
+        except Exception:
+            return 200, {"consented": False, "consented_at": None, "managed": False}
+
+    def handle_set_telemetry_consent(self, req: dict) -> Tuple[int, dict]:
+        """POST /api/telemetry-consent — grant or revoke consent."""
+        body = req.get("body", {})
+        consent = body.get("consent")
+        if consent is None:
+            return 400, {"error": "Missing required field: consent (true/false)"}
+
+        try:
+            from core.enterprise.telemetry import TelemetryReporter
+            if consent:
+                TelemetryReporter.grant_consent()
+            else:
+                TelemetryReporter.revoke_consent()
+            return 200, TelemetryReporter.get_consent_status()
+        except Exception as e:
+            return 500, {"error": f"Could not update consent: {e}"}
+
+    # -- Backup & restore ---------------------------------------------------
+
+    def handle_create_backup(self, req: dict) -> Tuple[int, dict]:
+        """POST /api/backup — create a backup of ~/.intentos."""
+        try:
+            from core.enterprise.backup import BackupManager
+            mgr = BackupManager()
+            path = mgr.create_backup()
+            stat = Path(path).stat()
+            return 200, {
+                "path": path,
+                "size_mb": round(stat.st_size / (1024 * 1024), 2),
+            }
+        except Exception as e:
+            return 500, {"error": f"Backup failed: {e}"}
+
+    def handle_list_backups(self, req: dict) -> Tuple[int, dict]:
+        """GET /api/backups — list available backups."""
+        try:
+            from core.enterprise.backup import BackupManager
+            mgr = BackupManager()
+            return 200, {"backups": mgr.list_backups()}
+        except Exception as e:
+            return 500, {"error": f"Could not list backups: {e}"}
+
+    def handle_data_summary(self, req: dict) -> Tuple[int, dict]:
+        """GET /api/data-summary — return a summary of ~/.intentos data."""
+        try:
+            from core.enterprise.backup import BackupManager
+            mgr = BackupManager()
+            return 200, mgr.get_data_summary()
+        except Exception as e:
+            return 500, {"error": f"Could not get data summary: {e}"}
 
 
 # ---------------------------------------------------------------------------

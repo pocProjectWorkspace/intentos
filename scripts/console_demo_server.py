@@ -11,11 +11,17 @@ import os
 import random
 import re
 import sqlite3
+import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+# Rate limiting: max requests per IP per minute
+_RATE_LIMIT = 60  # requests per minute
+_rate_counts = defaultdict(list)  # ip -> [timestamps]
 
 DB_PATH = Path.home() / ".intentos" / "console_demo.db"
 
@@ -1042,9 +1048,9 @@ input[type="range"]{width:100%;accent-color:var(--cyan)}
     <div class="nav-item" data-page="policies"><span class="icon">&#128203;</span> Policy Manager</div>
     <div class="nav-item" data-page="devices"><span class="icon">&#128187;</span> Devices</div>
     <div class="nav-item" data-page="audit"><span class="icon">&#128220;</span> Audit Log</div>
-    <div class="nav-item" data-page="api-keys"><span class="icon">&#128273;</span> API Keys</div>
-    <div class="nav-item" data-page="connectors"><span class="icon">&#128268;</span> Connectors</div>
-    <div class="nav-item" data-page="licenses"><span class="icon">&#127991;</span> Licenses</div>
+    <div class="nav-item admin-only" data-page="api-keys"><span class="icon">&#128273;</span> API Keys</div>
+    <div class="nav-item admin-only" data-page="connectors"><span class="icon">&#128268;</span> Connectors</div>
+    <div class="nav-item admin-only" data-page="licenses"><span class="icon">&#127991;</span> Licenses</div>
     <div class="nav-item" data-page="roi"><span class="icon">&#128176;</span> ROI Calculator</div>
   </div>
   <div class="sidebar-footer">
@@ -1128,6 +1134,10 @@ function showApp() {
   const user = JSON.parse(localStorage.getItem('intentos_user')||'{}');
   const userInfo = document.getElementById('user-info');
   if(userInfo && user.name) userInfo.textContent = user.name + ' (' + user.role + ')';
+  // RBAC: hide admin-only nav items for non-admin users
+  document.querySelectorAll('.admin-only').forEach(el => {
+    el.style.display = (user.role === 'admin') ? 'flex' : 'none';
+  });
   const initHash = window.location.hash.replace('#','') || 'dashboard';
   if(!window.location.hash) window.location.hash = '#dashboard';
   setActivePage(initHash.split('/')[0]);
@@ -2306,38 +2316,69 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
-    def _check_auth(self, path: str, conn: sqlite3.Connection) -> bool:
-        """Check auth for API routes. Returns True if authorized (or no auth needed)."""
+    def _check_auth(self, path: str, conn: sqlite3.Connection):
+        """Check auth for API routes. Returns (username, role) or None.
+
+        Sends 401 response and returns None if unauthorized.
+        For non-API routes or exempt endpoints, returns ('_anonymous', 'admin').
+        """
         if not path.startswith("/api/v1/"):
-            return True
+            return ("_anonymous", "admin")
         # Exempt endpoints
         if path == "/api/v1/auth/login" or path == "/api/v1/telemetry/heartbeat":
-            return True
+            return ("_anonymous", "admin")
         hdrs = {k.lower(): v for k, v in self.headers.items()}
         user = verify_token(hdrs, conn)
         if not user:
             self._json(401, {"error": "Unauthorized — valid Bearer token required"})
+            return None
+        return (user["username"], user["role"])
+
+    def _check_rate_limit(self):
+        """Returns True if request is allowed, False if rate limited."""
+        ip = self.client_address[0]
+        now = time.time()
+        # Clean old entries
+        _rate_counts[ip] = [t for t in _rate_counts[ip] if now - t < 60]
+        if len(_rate_counts[ip]) >= _RATE_LIMIT:
             return False
+        _rate_counts[ip].append(now)
         return True
 
     def do_GET(self):
         path = urlparse(self.path).path.rstrip("/")
         parts = self._path_parts()
         params = self._query_params()
+        if not self._check_rate_limit():
+            return self._json(429, {"error": "Rate limit exceeded. Try again in a minute."})
         conn = get_db()
         try:
             if path == "" or path == "/":
                 return self._html(DASHBOARD_HTML)
-            if not self._check_auth(path, conn):
+            auth = self._check_auth(path, conn)
+            if not auth:
                 return
+            username, role = auth
             if path == "/api/v1/auth/me":
                 hdrs = {k.lower(): v for k, v in self.headers.items()}
                 user = verify_token(hdrs, conn)
                 if not user:
                     return self._json(401, {"error": "Unauthorized"})
                 return self._json(200, user)
+            # Admin-only GET endpoints
             if path == "/api/v1/licenses":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 return self._json(200, api_licenses_list(conn))
+            if path == "/api/v1/api-keys":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
+                return self._json(200, api_keys_list(conn))
+            if path == "/api/v1/connectors":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
+                return self._json(200, api_connectors_list(conn))
+            # Dashboard endpoints — all roles
             if path == "/api/v1/dashboard/fleet-overview":
                 return self._json(200, api_fleet_overview(conn))
             if path == "/api/v1/dashboard/ai-usage":
@@ -2346,8 +2387,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, api_cost_trend(conn))
             if path == "/api/v1/dashboard/compliance":
                 return self._json(200, api_compliance(conn))
+            # Policies — all roles can read
             if path == "/api/v1/policies":
                 return self._json(200, api_policies_list(conn))
+            # Devices — all roles can read
             if path == "/api/v1/devices":
                 return self._json(200, api_devices_list(conn))
             # GET /api/v1/devices/{id}
@@ -2356,12 +2399,25 @@ class Handler(BaseHTTPRequestHandler):
                 if result is None:
                     return self._json(404, {"error": "device not found"})
                 return self._json(200, result)
+            # Audit log — all roles
             if path == "/api/v1/audit-log":
                 return self._json(200, api_audit_log(params, conn))
-            if path == "/api/v1/api-keys":
-                return self._json(200, api_keys_list(conn))
-            if path == "/api/v1/connectors":
-                return self._json(200, api_connectors_list(conn))
+            # SIEM export — all roles
+            if path == "/api/v1/siem-export":
+                try:
+                    from core.enterprise.siem_export import SIEMExporter
+                    fmt = params.get("format", ["splunk"])[0]
+                    exporter = SIEMExporter()
+                    events = exporter._collect_local_events()
+                    if fmt == "splunk":
+                        formatted = exporter.export_splunk_hec(events)
+                    elif fmt == "sentinel":
+                        formatted = exporter.export_sentinel(events)
+                    else:
+                        formatted = events
+                    return self._json(200, {"format": fmt, "event_count": len(formatted), "events": formatted})
+                except Exception as e:
+                    return self._json(200, {"format": "none", "event_count": 0, "events": [], "error": str(e)})
             self._json(404, {"error": "not found"})
         finally:
             conn.close()
@@ -2369,6 +2425,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/")
         parts = self._path_parts()
+        # Exempt heartbeat from rate limiting (devices report frequently)
+        if path != "/api/v1/telemetry/heartbeat":
+            if not self._check_rate_limit():
+                return self._json(429, {"error": "Rate limit exceeded. Try again in a minute."})
         conn = get_db()
         try:
             body = self._read_body()
@@ -2378,30 +2438,43 @@ class Handler(BaseHTTPRequestHandler):
                 if result is None:
                     return self._json(401, {"error": "Invalid username or password"})
                 return self._json(200, result)
-            if not self._check_auth(path, conn):
+            auth = self._check_auth(path, conn)
+            if not auth:
                 return
+            username, role = auth
             if path == "/api/v1/telemetry/heartbeat":
                 result = api_heartbeat(body, hdrs, conn)
                 if result.get("status") == "error":
                     return self._json(403, result)
                 return self._json(200, result)
+            # Admin-only POST endpoints
             if path == "/api/v1/licenses/activate":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 result = api_licenses_activate(body, conn)
                 if result.get("error"):
                     return self._json(400, result)
                 return self._json(200, result)
             if path == "/api/v1/policies":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 return self._json(201, api_policies_create(body, conn))
             if path == "/api/v1/api-keys":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 return self._json(201, api_keys_create(body, conn))
             # POST /api/v1/api-keys/{id}/rotate
             if len(parts) == 6 and parts[3] == "api-keys" and parts[5] == "rotate":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 result = api_keys_rotate(parts[4], conn)
                 if result is None:
                     return self._json(404, {"error": "api key not found"})
                 return self._json(200, result)
             # POST /api/v1/connectors/{id}/test
             if len(parts) == 6 and parts[3] == "connectors" and parts[5] == "test":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 result = api_connectors_test(parts[4], conn)
                 if result is None:
                     return self._json(404, {"error": "connector not found"})
@@ -2413,31 +2486,43 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         path = urlparse(self.path).path.rstrip("/")
         parts = self._path_parts()
+        if not self._check_rate_limit():
+            return self._json(429, {"error": "Rate limit exceeded. Try again in a minute."})
         conn = get_db()
         try:
-            if not self._check_auth(path, conn):
+            auth = self._check_auth(path, conn)
+            if not auth:
                 return
+            username, role = auth
             body = self._read_body()
-            # PUT /api/v1/policies/{id}
+            # PUT /api/v1/policies/{id} — admin only
             if len(parts) == 5 and parts[3] == "policies":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 result = api_policies_update(parts[4], body, conn)
                 if result is None:
                     return self._json(404, {"error": "policy not found"})
                 return self._json(200, result)
-            # PUT /api/v1/devices/{id}/cloud-access
+            # PUT /api/v1/devices/{id}/cloud-access — admin only
             if len(parts) == 6 and parts[3] == "devices" and parts[5] == "cloud-access":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 result = api_device_cloud_access(parts[4], body, conn)
                 if result is None:
                     return self._json(404, {"error": "device not found"})
                 return self._json(200, result)
-            # PUT /api/v1/devices/{id}/api-keys
+            # PUT /api/v1/devices/{id}/api-keys — admin only
             if len(parts) == 6 and parts[3] == "devices" and parts[5] == "api-keys":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 result = api_device_api_keys(parts[4], body, conn)
                 if result is None:
                     return self._json(404, {"error": "device not found"})
                 return self._json(200, result)
-            # PUT /api/v1/api-keys/{id}/assign
+            # PUT /api/v1/api-keys/{id}/assign — admin only
             if len(parts) == 6 and parts[3] == "api-keys" and parts[5] == "assign":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 key_id = parts[4]
                 device_ids = body.get("device_ids", [])
                 existing = conn.execute("SELECT id FROM api_keys WHERE id=?", (key_id,)).fetchone()
@@ -2447,8 +2532,10 @@ class Handler(BaseHTTPRequestHandler):
                              (",".join(device_ids), key_id))
                 conn.commit()
                 return self._json(200, {"id": key_id, "assigned_devices": device_ids})
-            # PUT /api/v1/connectors/{id}
+            # PUT /api/v1/connectors/{id} — admin only
             if len(parts) == 5 and parts[3] == "connectors":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 result = api_connectors_update(parts[4], body, conn)
                 if result is None:
                     return self._json(404, {"error": "connector not found"})
@@ -2460,18 +2547,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path = urlparse(self.path).path.rstrip("/")
         parts = self._path_parts()
+        if not self._check_rate_limit():
+            return self._json(429, {"error": "Rate limit exceeded. Try again in a minute."})
         conn = get_db()
         try:
-            if not self._check_auth(path, conn):
+            auth = self._check_auth(path, conn)
+            if not auth:
                 return
-            # DELETE /api/v1/policies/{id}
+            username, role = auth
+            # DELETE /api/v1/policies/{id} — admin only
             if len(parts) == 5 and parts[3] == "policies":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 result = api_policies_delete(parts[4], conn)
                 if result is None:
                     return self._json(404, {"error": "policy not found"})
                 return self._json(200, result)
-            # DELETE /api/v1/api-keys/{id}
+            # DELETE /api/v1/api-keys/{id} — admin only
             if len(parts) == 5 and parts[3] == "api-keys":
+                if role != "admin":
+                    return self._json(403, {"error": "Admin access required"})
                 result = api_keys_delete(parts[4], conn)
                 if result is None:
                     return self._json(404, {"error": "api key not found"})

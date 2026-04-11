@@ -225,7 +225,8 @@ class TestStatus:
 
 
 class TestLifecycle:
-    def test_start_stop(self):
+    @patch.object(TelemetryReporter, "_check_consent", return_value=True)
+    def test_start_stop(self, _mock_consent):
         r = _make_reporter()
         assert r._running is False
 
@@ -237,8 +238,9 @@ class TestLifecycle:
         assert r._running is False
         assert r._timer is None
 
+    @patch.object(TelemetryReporter, "_check_consent", return_value=True)
     @patch("core.enterprise.telemetry.threading.Timer")
-    def test_timer_scheduling(self, mock_timer_cls):
+    def test_timer_scheduling(self, mock_timer_cls, _mock_consent):
         mock_timer = MagicMock()
         mock_timer_cls.return_value = mock_timer
 

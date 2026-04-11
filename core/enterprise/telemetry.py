@@ -73,12 +73,79 @@ class TelemetryReporter:
         self._send_count: int = 0
         self._error_count: int = 0
 
+    # -- consent -------------------------------------------------------------
+
+    def _check_consent(self) -> bool:
+        """Check if user has consented to telemetry."""
+        consent_file = self._base / "telemetry_consent.json"
+        if not consent_file.exists():
+            return False
+        try:
+            data = json.loads(consent_file.read_text())
+            return data.get("consented", False)
+        except Exception:
+            return False
+
+    @staticmethod
+    def grant_consent(base_path: Optional[Path] = None) -> None:
+        """Record user consent for telemetry collection."""
+        base = base_path or Path.home() / ".intentos"
+        base.mkdir(parents=True, exist_ok=True)
+        consent_file = base / "telemetry_consent.json"
+        consent_file.write_text(json.dumps({
+            "consented": True,
+            "consented_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }))
+
+    @staticmethod
+    def revoke_consent(base_path: Optional[Path] = None) -> None:
+        """Revoke telemetry consent and remove the consent file."""
+        base = base_path or Path.home() / ".intentos"
+        consent_file = base / "telemetry_consent.json"
+        if consent_file.exists():
+            consent_file.write_text(json.dumps({
+                "consented": False,
+                "revoked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }))
+
+    @staticmethod
+    def get_consent_status(base_path: Optional[Path] = None) -> dict:
+        """Return the current consent status."""
+        base = base_path or Path.home() / ".intentos"
+        consent_file = base / "telemetry_consent.json"
+        if not consent_file.exists():
+            return {"consented": False, "consented_at": None, "managed": False}
+        try:
+            data = json.loads(consent_file.read_text())
+            return {
+                "consented": data.get("consented", False),
+                "consented_at": data.get("consented_at"),
+                "managed": False,
+            }
+        except Exception:
+            return {"consented": False, "consented_at": None, "managed": False}
+
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
         """Begin periodic heartbeats in a background thread."""
         if self._running:
             return
+
+        # Enterprise policy-managed mode skips consent check
+        is_managed = (
+            self._policy is not None
+            and hasattr(self._policy, "is_managed")
+            and self._policy.is_managed
+        )
+
+        if not is_managed and not self._check_consent():
+            logger.info(
+                "Telemetry not started — user has not consented. "
+                "Call TelemetryReporter.grant_consent() to enable."
+            )
+            return
+
         self._running = True
         self._schedule_next()
         logger.info(
