@@ -5,10 +5,14 @@ import { TaskHistory } from './components/TaskHistory';
 import { ResultPane } from './components/ResultPane';
 import { Settings } from './components/Settings';
 import { StatusBar } from './components/StatusBar';
+import { SetupWizard } from './components/SetupWizard';
+import { isTauri } from './lib/platform';
 import { useIntentOS } from './hooks/useIntentOS';
 import './App.css';
 
 function App() {
+  const [setupComplete, setSetupComplete] = useState(!isTauri());
+
   const {
     tasks, settings, isLoading, stream,
     sessions, activeSessionId, chatMessages,
@@ -33,6 +37,10 @@ function App() {
     },
     [loadSession],
   );
+
+  if (!setupComplete) {
+    return <SetupWizard onComplete={() => setSetupComplete(true)} />;
+  }
 
   return (
     <div className="app">

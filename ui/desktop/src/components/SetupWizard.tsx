@@ -1,189 +1,148 @@
-import { useState, useEffect } from 'react';
-import { isTauri } from '../lib/platform';
-import type { PullProgress } from '../lib/tauri-api';
+import { useState, useEffect, useRef } from 'react';
 
 interface SetupWizardProps {
   onComplete: () => void;
 }
 
-type SetupStage =
-  | 'checking'
-  | 'needs-setup'
-  | 'installing'
-  | 'pulling'
-  | 'ready'
-  | 'error';
+type Stage = 'loading' | 'no-ollama' | 'timeout';
 
-const STAGE_LABELS: Record<string, string> = {
-  checking: 'Checking your system...',
-  'needs-setup': '',
-  installing: 'Installing local AI engine...',
-  pulling: 'Downloading your local AI...',
-  ready: 'IntentOS is ready.',
-  error: 'Something went wrong.',
-};
+const HEALTH_URL = 'http://127.0.0.1:7891/api/health';
+const OLLAMA_URL = 'http://localhost:11434/api/tags';
+const MAX_ATTEMPTS = 30;
+const POLL_INTERVAL = 2000;
 
 export function SetupWizard({ onComplete }: SetupWizardProps) {
-  const [stage, setStage] = useState<SetupStage>('checking');
-  const [progress, setProgress] = useState<PullProgress | null>(null);
-  const [error, setError] = useState('');
+  const [stage, setStage] = useState<Stage>('loading');
+  const attemptRef = useRef(0);
+  const cancelledRef = useRef(false);
 
   useEffect(() => {
-    if (!isTauri()) {
-      // Browser dev mode — skip setup
-      onComplete();
-      return;
-    }
+    cancelledRef.current = false;
+    attemptRef.current = 0;
 
-    let cancelled = false;
-
-    async function checkStatus() {
-      try {
-        const { getBackendStatus, onPullProgress, onOllamaStatusChange } =
-          await import('../lib/tauri-api');
-
-        // Listen for pull progress
-        onPullProgress((p) => {
-          if (!cancelled) setProgress(p);
-        });
-
-        // Listen for Ollama status changes
-        onOllamaStatusChange((status) => {
-          if (cancelled) return;
-          if (status === 'installing') setStage('installing');
-          else if (status === 'pulling' || status === 'pulling-embeddings') setStage('pulling');
-          else if (status === 'ready') {
-            setStage('ready');
-            setTimeout(onComplete, 1500);
-          }
-        });
-
-        const status = await getBackendStatus();
-        if (!cancelled) {
-          if (status.backend_alive && status.ollama.models.length > 0) {
-            // Already set up
-            onComplete();
-          } else if (!status.ollama.installed || status.ollama.models.length === 0) {
-            setStage('needs-setup');
-          } else {
-            // Ollama installed with models, just waiting for backend
-            onComplete();
-          }
-        }
-      } catch {
-        // Tauri IPC failed — try direct HTTP health check as fallback
+    async function poll() {
+      while (!cancelledRef.current && attemptRef.current < MAX_ATTEMPTS) {
+        attemptRef.current += 1;
         try {
-          const res = await fetch('http://127.0.0.1:7891/api/health');
-          if (res.ok && !cancelled) {
-            onComplete();
+          const res = await fetch(HEALTH_URL);
+          if (res.ok && !cancelledRef.current) {
+            // Backend is alive — check Ollama
+            try {
+              const ollamaRes = await fetch(OLLAMA_URL);
+              if (ollamaRes.ok) {
+                onComplete();
+                return;
+              }
+            } catch {
+              // Ollama not running
+            }
+            if (!cancelledRef.current) {
+              setStage('no-ollama');
+            }
             return;
           }
-        } catch { /* backend not ready */ }
-
-        if (!cancelled) {
-          // Backend not ready yet — wait and retry
-          setTimeout(checkStatus, 2000);
+        } catch {
+          // Backend not ready yet
         }
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+      }
+
+      // Exhausted attempts
+      if (!cancelledRef.current) {
+        setStage('timeout');
       }
     }
 
-    checkStatus();
+    poll();
 
     return () => {
-      cancelled = true;
+      cancelledRef.current = true;
     };
   }, [onComplete]);
 
-  async function handleSetup() {
-    try {
-      setStage('installing');
-      const { setupOllama } = await import('../lib/tauri-api');
-
-      // For now, use a default model. The backend will detect hardware.
-      await setupOllama('llama3.1:8b');
-      setStage('ready');
-      setTimeout(onComplete, 1500);
-    } catch (e) {
-      setStage('error');
-      setError(String(e));
-    }
+  function handleRetry() {
+    attemptRef.current = 0;
+    cancelledRef.current = false;
+    setStage('loading');
+    // Re-trigger the effect by forcing a state change — the effect depends on onComplete
+    // which is stable, so we manually restart polling here.
+    (async () => {
+      while (!cancelledRef.current && attemptRef.current < MAX_ATTEMPTS) {
+        attemptRef.current += 1;
+        try {
+          const res = await fetch(HEALTH_URL);
+          if (res.ok && !cancelledRef.current) {
+            try {
+              const ollamaRes = await fetch(OLLAMA_URL);
+              if (ollamaRes.ok) {
+                onComplete();
+                return;
+              }
+            } catch {
+              // Ollama not running
+            }
+            if (!cancelledRef.current) {
+              setStage('no-ollama');
+            }
+            return;
+          }
+        } catch {
+          // Backend not ready yet
+        }
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+      }
+      if (!cancelledRef.current) {
+        setStage('timeout');
+      }
+    })();
   }
-
-  function handleSkip() {
-    onComplete();
-  }
-
-  const progressBar =
-    progress && progress.percent > 0 ? (
-      <div className="setup-progress">
-        <div className="setup-progress__bar">
-          <div
-            className="setup-progress__fill"
-            style={{ width: `${Math.min(progress.percent, 100)}%` }}
-          />
-        </div>
-        <span className="setup-progress__text">
-          {progress.percent.toFixed(0)}%
-        </span>
-      </div>
-    ) : null;
 
   return (
     <div className="setup-wizard">
       <div className="setup-wizard__card">
         <h1 className="setup-wizard__title">IntentOS</h1>
-        <p className="setup-wizard__subtitle">
-          Your computer, finally on your side.
-        </p>
 
-        {stage === 'checking' && (
-          <p className="setup-wizard__status">{STAGE_LABELS.checking}</p>
+        {stage === 'loading' && (
+          <div className="setup-wizard__loading">
+            <div className="setup-wizard__spinner" />
+            <p className="setup-wizard__status">Starting IntentOS...</p>
+          </div>
         )}
 
-        {stage === 'needs-setup' && (
+        {stage === 'no-ollama' && (
           <div className="setup-wizard__choices">
-            <p>IntentOS can run AI entirely on your device.</p>
-            <p>This requires a one-time download (~2 GB).</p>
+            <p className="setup-wizard__status">
+              Local AI engine not detected. IntentOS works best with Ollama
+              installed.
+            </p>
             <div className="setup-wizard__buttons">
-              <button className="setup-wizard__btn--primary" onClick={handleSetup}>
-                Set up local AI
+              <button
+                className="setup-wizard__btn--primary"
+                onClick={() => window.open('https://ollama.com', '_blank')}
+              >
+                Download Ollama
               </button>
-              <button className="setup-wizard__btn--secondary" onClick={handleSkip}>
-                Skip for now
+              <button
+                className="setup-wizard__btn--secondary"
+                onClick={onComplete}
+              >
+                Continue without local AI
               </button>
             </div>
           </div>
         )}
 
-        {(stage === 'installing' || stage === 'pulling') && (
-          <div className="setup-wizard__progress">
-            <p className="setup-wizard__status">{STAGE_LABELS[stage]}</p>
-            {progressBar}
-            <p className="setup-wizard__hint">
-              This happens once. After this, IntentOS works instantly — even
-              without an internet connection.
+        {stage === 'timeout' && (
+          <div className="setup-wizard__choices">
+            <p className="setup-wizard__status">
+              IntentOS backend is starting...
             </p>
-          </div>
-        )}
-
-        {stage === 'ready' && (
-          <p className="setup-wizard__status setup-wizard__status--success">
-            {STAGE_LABELS.ready}
-          </p>
-        )}
-
-        {stage === 'error' && (
-          <div className="setup-wizard__error">
-            <p className="setup-wizard__status setup-wizard__status--error">
-              {STAGE_LABELS.error}
-            </p>
-            <p>{error}</p>
             <div className="setup-wizard__buttons">
-              <button className="setup-wizard__btn--primary" onClick={handleSetup}>
-                Try again
-              </button>
-              <button className="setup-wizard__btn--secondary" onClick={handleSkip}>
-                Skip for now
+              <button
+                className="setup-wizard__btn--primary"
+                onClick={handleRetry}
+              >
+                Retry
               </button>
             </div>
           </div>

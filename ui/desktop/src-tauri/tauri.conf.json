@@ -34,7 +34,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "targets": ["nsis"],
+    "targets": "all",
     "externalBin": [
       "binaries/intentos-backend"
     ],
@@ -54,6 +54,10 @@
   "plugins": {
     "shell": {
       "open": true
+    },
+    "updater": {
+      "endpoints": ["https://github.com/pocProjectWorkspace/intentos/releases/latest/download/latest.json"],
+      "pubkey": ""
     }
   }
 }

@@ -5,6 +5,7 @@ Self-contained IT admin console for IntentOS enterprise fleet management.
 Uses http.server + sqlite3 + json. No third-party packages.
 """
 
+import hashlib
 import json
 import os
 import random
@@ -102,12 +103,37 @@ def init_db(conn: sqlite3.Connection):
         last_tested TEXT,
         created_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password_hash TEXT,
+        role TEXT,
+        name TEXT
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        username TEXT,
+        role TEXT,
+        created_at TEXT,
+        expires_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS licenses (
+        id TEXT PRIMARY KEY,
+        license_key TEXT,
+        tier TEXT,
+        max_seats INTEGER,
+        used_seats INTEGER,
+        expires_at TEXT,
+        activated_at TEXT,
+        status TEXT
+    );
     """)
     conn.commit()
 
 
 def seed_data(conn: sqlite3.Connection):
     if conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0] > 0:
+        _seed_users(conn)
+        _seed_licenses(conn)
         _seed_connectors(conn)
         return
     now = datetime.utcnow()
@@ -255,7 +281,34 @@ def seed_data(conn: sqlite3.Connection):
         "VALUES (?,?,?,?,?,?,?)", audit_rows)
 
     conn.commit()
+    _seed_users(conn)
+    _seed_licenses(conn)
     _seed_connectors(conn)
+
+
+def _seed_users(conn: sqlite3.Connection):
+    """Seed the users table if empty."""
+    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
+        return
+    pw_hash = hashlib.sha256("intentos".encode()).hexdigest()
+    conn.executemany(
+        "INSERT INTO users VALUES (?,?,?,?)", [
+            ("admin", pw_hash, "admin", "IT Administrator"),
+            ("analyst", pw_hash, "analyst", "SOC Analyst"),
+        ])
+    conn.commit()
+
+
+def _seed_licenses(conn: sqlite3.Connection):
+    """Seed the licenses table if empty."""
+    if conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0] > 0:
+        return
+    now = datetime.utcnow()
+    conn.execute(
+        "INSERT INTO licenses VALUES (?,?,?,?,?,?,?,?)",
+        (str(uuid.uuid4()), "INTENT-ENT-2026-7X4F", "enterprise", 500, 47,
+         "2027-12-31T23:59:59", (now - timedelta(days=90)).isoformat(), "active"))
+    conn.commit()
 
 
 def _seed_connectors(conn: sqlite3.Connection):
@@ -635,6 +688,67 @@ def api_connectors_test(connector_id: str, conn: sqlite3.Connection) -> dict:
     return {"success": True, "message": messages.get(existing["id"], "Connection test passed")}
 
 
+def api_auth_login(body: dict, conn: sqlite3.Connection) -> dict:
+    username = body.get("username", "")
+    password = body.get("password", "")
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    user = conn.execute(
+        "SELECT username, role, name FROM users WHERE username=? AND password_hash=?",
+        (username, pw_hash)).fetchone()
+    if not user:
+        return None
+    token = uuid.uuid4().hex
+    now = datetime.utcnow()
+    expires = now + timedelta(hours=24)
+    conn.execute("INSERT INTO sessions VALUES (?,?,?,?,?)",
+                 (token, user["username"], user["role"],
+                  now.isoformat(), expires.isoformat()))
+    conn.commit()
+    return {
+        "token": token,
+        "user": {"username": user["username"], "role": user["role"], "name": user["name"]}
+    }
+
+
+def api_auth_me(token: str, conn: sqlite3.Connection) -> dict:
+    now = datetime.utcnow().isoformat()
+    session = conn.execute(
+        "SELECT s.username, s.role, u.name FROM sessions s "
+        "JOIN users u ON s.username = u.username "
+        "WHERE s.token=? AND s.expires_at>?",
+        (token, now)).fetchone()
+    if not session:
+        return None
+    return {"username": session["username"], "role": session["role"], "name": session["name"]}
+
+
+def verify_token(headers: dict, conn: sqlite3.Connection) -> dict:
+    """Verify Bearer token. Returns user dict or None."""
+    auth = headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:]
+    return api_auth_me(token, conn)
+
+
+def api_licenses_list(conn: sqlite3.Connection) -> list:
+    return [dict(r) for r in conn.execute("SELECT * FROM licenses ORDER BY activated_at DESC").fetchall()]
+
+
+def api_licenses_activate(body: dict, conn: sqlite3.Connection) -> dict:
+    key = body.get("license_key", "")
+    if not re.match(r"^INTENT-[A-Z]{3}-\d{4}-[A-Z0-9]{4}$", key):
+        return {"error": "Invalid license key format. Expected: INTENT-XXX-XXXX-XXXX"}
+    now = datetime.utcnow()
+    lid = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO licenses VALUES (?,?,?,?,?,?,?,?)",
+        (lid, key, "enterprise", 500, 0,
+         (now + timedelta(days=365)).isoformat(), now.isoformat(), "active"))
+    conn.commit()
+    return {"id": lid, "status": "activated", "license_key": key}
+
+
 # ---------------------------------------------------------------------------
 # Dashboard HTML — single-page app with hash routing
 # ---------------------------------------------------------------------------
@@ -802,9 +916,38 @@ input[type="range"]{width:100%;accent-color:var(--cyan)}
 }
 </style></head><body>
 
+<!-- Login Screen -->
+<div id="login-screen" class="hidden" style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg)">
+  <div style="width:380px;background:var(--card);border:1px solid var(--card-border);border-radius:16px;padding:40px;backdrop-filter:blur(12px)">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+      <div style="width:12px;height:12px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)"></div>
+      <h1 style="font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700">IntentOS Console</h1>
+    </div>
+    <p style="color:var(--dim);font-size:13px;margin-bottom:28px">Sign in to manage your fleet</p>
+    <div id="login-error" style="display:none;background:#ef444418;color:var(--red);padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px"></div>
+    <div class="form-group">
+      <label>Username</label>
+      <input type="text" id="login-username" placeholder="admin" autofocus>
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="password" id="login-password" placeholder="Password" onkeydown="if(event.key==='Enter')doLogin()">
+    </div>
+    <button class="btn primary" style="width:100%;justify-content:center;padding:10px;margin-top:8px" onclick="doLogin()">Sign In</button>
+    <div style="position:relative;margin-top:12px">
+      <button class="btn" style="width:100%;justify-content:center;padding:10px;opacity:0.5;cursor:default" title="Coming soon"
+        onmouseover="document.getElementById('sso-tooltip').style.display='block'"
+        onmouseout="document.getElementById('sso-tooltip').style.display='none'">
+        Sign in with Okta SSO
+      </button>
+      <div id="sso-tooltip" style="display:none;position:absolute;top:-32px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--card-border);color:var(--amber);font-size:11px;padding:4px 10px;border-radius:6px;white-space:nowrap">Coming soon</div>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
-<nav class="sidebar">
+<nav class="sidebar" id="sidebar-nav" class="hidden">
   <div class="sidebar-logo"><div class="dot"></div>IntentOS Console</div>
   <div class="nav-items">
     <div class="nav-item active" data-page="dashboard"><span class="icon">&#128202;</span> Dashboard</div>
@@ -814,9 +957,14 @@ input[type="range"]{width:100%;accent-color:var(--cyan)}
     <div class="nav-item" data-page="audit"><span class="icon">&#128220;</span> Audit Log</div>
     <div class="nav-item" data-page="api-keys"><span class="icon">&#128273;</span> API Keys</div>
     <div class="nav-item" data-page="connectors"><span class="icon">&#128268;</span> Connectors</div>
+    <div class="nav-item" data-page="licenses"><span class="icon">&#127991;</span> Licenses</div>
     <div class="nav-item" data-page="roi"><span class="icon">&#128176;</span> ROI Calculator</div>
   </div>
-  <div class="sidebar-footer"><span class="online-count" id="online-count">0</span> devices online</div>
+  <div class="sidebar-footer">
+    <div><span class="online-count" id="online-count">0</span> devices online</div>
+    <div id="user-info" style="margin-top:8px;font-size:11px;color:var(--dim)"></div>
+    <button class="btn sm" onclick="doLogout()" style="margin-top:8px;width:100%;justify-content:center;font-size:11px">Sign Out</button>
+  </div>
 </nav>
 
 <div class="main" id="app">Loading...</div>
@@ -836,7 +984,11 @@ const ago = iso => {
   return Math.floor(s/86400)+'d ago';
 };
 const api = async (path, opts={}) => {
-  const r = await fetch(BASE+path, {headers:{'Content-Type':'application/json'}, ...opts});
+  const token = localStorage.getItem('intentos_token');
+  const headers = {'Content-Type':'application/json'};
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(BASE+path, {headers, ...opts});
+  if(r.status === 401 && !path.includes('/auth/')) { doLogout(); return {}; }
   return r.json();
 };
 function showToast(msg) {
@@ -844,6 +996,54 @@ function showToast(msg) {
   t.textContent = msg;
   t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// -- Auth --
+window.doLogin = async () => {
+  const username = document.getElementById('login-username').value;
+  const password = document.getElementById('login-password').value;
+  const errEl = document.getElementById('login-error');
+  errEl.style.display = 'none';
+  try {
+    const r = await fetch(BASE+'/api/v1/auth/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const data = await r.json();
+    if(r.ok && data.token) {
+      localStorage.setItem('intentos_token', data.token);
+      localStorage.setItem('intentos_user', JSON.stringify(data.user));
+      showApp();
+    } else {
+      errEl.textContent = data.error || 'Invalid username or password';
+      errEl.style.display = 'block';
+    }
+  } catch(e) {
+    errEl.textContent = 'Could not connect to server';
+    errEl.style.display = 'block';
+  }
+};
+window.doLogout = () => {
+  localStorage.removeItem('intentos_token');
+  localStorage.removeItem('intentos_user');
+  showLogin();
+};
+function showLogin() {
+  document.getElementById('login-screen').classList.remove('hidden');
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('sidebar-nav').style.display = 'none';
+  document.getElementById('app').style.display = 'none';
+}
+function showApp() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('sidebar-nav').style.display = 'flex';
+  document.getElementById('app').style.display = 'block';
+  const user = JSON.parse(localStorage.getItem('intentos_user')||'{}');
+  const userInfo = document.getElementById('user-info');
+  if(userInfo && user.name) userInfo.textContent = user.name + ' (' + user.role + ')';
+  const initHash = window.location.hash.replace('#','') || 'dashboard';
+  if(!window.location.hash) window.location.hash = '#dashboard';
+  setActivePage(initHash.split('/')[0]);
 }
 
 let refreshTimer = null;
@@ -881,6 +1081,7 @@ async function renderPage(page) {
     else if(page === 'audit') await renderAudit(app);
     else if(page === 'api-keys') await renderApiKeys(app);
     else if(page === 'connectors') await renderConnectors(app);
+    else if(page === 'licenses') await renderLicenses(app);
     else if(page === 'roi') renderROI(app);
     else app.innerHTML = '<div style="padding:40px;color:var(--dim)">Page not found</div>';
   } catch(e) { console.error(e); app.innerHTML = '<div style="padding:40px;color:var(--red)">Error loading page</div>'; }
@@ -1887,10 +2088,88 @@ window.assignKeyToDevices = async (keyId) => {
   renderApiKeys($('#app'));
 };
 
+// -- Licenses Page --
+async function renderLicenses(app) {
+  const licenses = await api('/api/v1/licenses');
+  const current = licenses[0] || {};
+  const maskedKey = current.license_key ? current.license_key.replace(/(.{10})(.*)(.{4})/, '$1-****-$3') : 'N/A';
+  const usedPct = current.max_seats ? Math.round((current.used_seats / current.max_seats) * 100) : 0;
+  const barW = 400;
+  const usedW = Math.round(barW * usedPct / 100);
+
+  const historyRows = licenses.map(l => `<tr>
+    <td>${l.activated_at ? new Date(l.activated_at).toLocaleDateString() : 'N/A'}</td>
+    <td><span class="mono" style="font-size:12px">${l.license_key}</span></td>
+    <td>${l.tier}</td>
+    <td>${l.max_seats} seats</td>
+    <td><span class="badge ${l.status==='active'?'online':'offline'}">${l.status}</span></td>
+  </tr>`).join('');
+
+  app.innerHTML = `
+  <h1 class="page-title">License Management</h1>
+
+  <div class="card" style="margin-bottom:24px">
+    <h3 style="font-size:16px;margin-bottom:16px">Current License</h3>
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;font-size:14px">
+      <div><span style="color:var(--dim)">License Key:</span> <span class="mono">${maskedKey}</span></div>
+      <div><span style="color:var(--dim)">Tier:</span> <span style="text-transform:capitalize">${current.tier||'N/A'}</span></div>
+      <div><span style="color:var(--dim)">Seats:</span> ${current.used_seats||0} / ${current.max_seats||0} used</div>
+      <div><span style="color:var(--dim)">Expires:</span> ${current.expires_at ? new Date(current.expires_at).toLocaleDateString() : 'N/A'}</div>
+      <div><span style="color:var(--dim)">Status:</span> <span class="badge ${current.status==='active'?'online':'offline'}">${current.status||'N/A'}</span></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:24px">
+    <h3 style="font-size:16px;margin-bottom:16px">Seat Usage</h3>
+    <svg width="${barW+80}" height="60" viewBox="0 0 ${barW+80} 60">
+      <rect x="0" y="10" width="${barW}" height="30" rx="6" fill="rgba(255,255,255,0.06)"/>
+      <rect x="0" y="10" width="${usedW}" height="30" rx="6" fill="url(#seatGrad)"/>
+      <defs><linearGradient id="seatGrad" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#06b6d4"/><stop offset="100%" stop-color="#2563eb"/></linearGradient></defs>
+      <text x="${barW+10}" y="30" fill="#e2e8f0" font-family="JetBrains Mono" font-size="13">${usedPct}%</text>
+      <text x="10" y="30" fill="#fff" font-family="JetBrains Mono" font-size="11">${current.used_seats||0} used</text>
+    </svg>
+  </div>
+
+  <div class="inline-form" style="margin-bottom:24px">
+    <h3>Activate License</h3>
+    <div style="display:flex;gap:12px;align-items:end;margin-top:12px">
+      <div class="form-group" style="flex:1;margin-bottom:0">
+        <label>License Key</label>
+        <input type="text" id="license-key-input" placeholder="INTENT-XXX-XXXX-XXXX">
+      </div>
+      <button class="btn primary" onclick="activateLicense()">Activate</button>
+    </div>
+    <div id="license-error" style="display:none;margin-top:8px;font-size:13px;color:var(--red)"></div>
+  </div>
+
+  <section>
+    <h2>License History</h2>
+    <table><thead><tr><th>Activated</th><th>License Key</th><th>Tier</th><th>Seats</th><th>Status</th></tr></thead>
+    <tbody>${historyRows || '<tr><td colspan="5" style="text-align:center;color:var(--dim)">No license history</td></tr>'}</tbody></table>
+  </section>`;
+}
+
+window.activateLicense = async () => {
+  const key = document.getElementById('license-key-input').value.trim();
+  const errEl = document.getElementById('license-error');
+  errEl.style.display = 'none';
+  const result = await api('/api/v1/licenses/activate', {method:'POST', body:JSON.stringify({license_key:key})});
+  if(result.error) {
+    errEl.textContent = result.error;
+    errEl.style.display = 'block';
+  } else {
+    showToast('License activated');
+    renderLicenses($('#app'));
+  }
+};
+
 // -- Init --
-const initHash = window.location.hash.replace('#','') || 'dashboard';
-if(!window.location.hash) window.location.hash = '#dashboard';
-setActivePage(initHash.split('/')[0]);
+if(localStorage.getItem('intentos_token')) {
+  showApp();
+} else {
+  showLogin();
+}
 </script>
 </body></html>"""
 
@@ -1902,7 +2181,7 @@ class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Device-Token")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Device-Token, Authorization")
 
     def _json(self, code: int, data):
         body = json.dumps(data, default=str).encode()
@@ -1940,6 +2219,20 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def _check_auth(self, path: str, conn: sqlite3.Connection) -> bool:
+        """Check auth for API routes. Returns True if authorized (or no auth needed)."""
+        if not path.startswith("/api/v1/"):
+            return True
+        # Exempt endpoints
+        if path == "/api/v1/auth/login" or path == "/api/v1/telemetry/heartbeat":
+            return True
+        hdrs = {k.lower(): v for k, v in self.headers.items()}
+        user = verify_token(hdrs, conn)
+        if not user:
+            self._json(401, {"error": "Unauthorized — valid Bearer token required"})
+            return False
+        return True
+
     def do_GET(self):
         path = urlparse(self.path).path.rstrip("/")
         parts = self._path_parts()
@@ -1948,6 +2241,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "" or path == "/":
                 return self._html(DASHBOARD_HTML)
+            if not self._check_auth(path, conn):
+                return
+            if path == "/api/v1/auth/me":
+                hdrs = {k.lower(): v for k, v in self.headers.items()}
+                user = verify_token(hdrs, conn)
+                if not user:
+                    return self._json(401, {"error": "Unauthorized"})
+                return self._json(200, user)
+            if path == "/api/v1/licenses":
+                return self._json(200, api_licenses_list(conn))
             if path == "/api/v1/dashboard/fleet-overview":
                 return self._json(200, api_fleet_overview(conn))
             if path == "/api/v1/dashboard/ai-usage":
@@ -1983,8 +2286,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._read_body()
             hdrs = {k.lower(): v for k, v in self.headers.items()}
+            if path == "/api/v1/auth/login":
+                result = api_auth_login(body, conn)
+                if result is None:
+                    return self._json(401, {"error": "Invalid username or password"})
+                return self._json(200, result)
+            if not self._check_auth(path, conn):
+                return
             if path == "/api/v1/telemetry/heartbeat":
                 return self._json(200, api_heartbeat(body, hdrs, conn))
+            if path == "/api/v1/licenses/activate":
+                result = api_licenses_activate(body, conn)
+                if result.get("error"):
+                    return self._json(400, result)
+                return self._json(200, result)
             if path == "/api/v1/policies":
                 return self._json(201, api_policies_create(body, conn))
             if path == "/api/v1/api-keys":
@@ -2010,6 +2325,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = self._path_parts()
         conn = get_db()
         try:
+            if not self._check_auth(path, conn):
+                return
             body = self._read_body()
             # PUT /api/v1/policies/{id}
             if len(parts) == 5 and parts[3] == "policies":
@@ -2055,6 +2372,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = self._path_parts()
         conn = get_db()
         try:
+            if not self._check_auth(path, conn):
+                return
             # DELETE /api/v1/policies/{id}
             if len(parts) == 5 and parts[3] == "policies":
                 result = api_policies_delete(parts[4], conn)

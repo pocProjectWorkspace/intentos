@@ -6,6 +6,7 @@
     "core:default",
     "shell:allow-execute",
     "shell:allow-open",
-    "process:allow-exit"
+    "process:allow-exit",
+    "updater:default"
   ]
 }
