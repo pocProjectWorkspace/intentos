@@ -598,6 +598,375 @@ def _extract_kyc_fields(params: dict, context: dict) -> dict:
 # generate_credit_summary
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Loan application requirements by type
+# ---------------------------------------------------------------------------
+
+LOAN_REQUIREMENTS: dict[str, dict] = {
+    "home_loan": {
+        "display_name": "Home Loan",
+        "required": ["AADHAAR", "PAN", "BANK_STATEMENT"],
+        "optional": ["DRIVING_LICENSE", "VOTER_ID", "PASSPORT"],
+        "additional": ["property_valuation", "sale_agreement", "property_tax_receipt"],
+        "min_bank_statement_months": 6,
+    },
+    "personal_loan": {
+        "display_name": "Personal Loan",
+        "required": ["AADHAAR", "PAN", "BANK_STATEMENT"],
+        "optional": ["DRIVING_LICENSE", "VOTER_ID"],
+        "additional": ["salary_slip"],
+        "min_bank_statement_months": 3,
+    },
+    "vehicle_loan": {
+        "display_name": "Vehicle Loan",
+        "required": ["AADHAAR", "PAN", "DRIVING_LICENSE", "BANK_STATEMENT"],
+        "optional": ["VOTER_ID"],
+        "additional": ["vehicle_quotation"],
+        "min_bank_statement_months": 6,
+    },
+    "business_loan": {
+        "display_name": "Business Loan",
+        "required": ["AADHAAR", "PAN", "BANK_STATEMENT"],
+        "optional": ["DRIVING_LICENSE", "VOTER_ID"],
+        "additional": ["gst_certificate", "itr_last_2_years", "business_registration"],
+        "min_bank_statement_months": 12,
+    },
+    "default": {
+        "display_name": "General Loan",
+        "required": ["AADHAAR", "PAN", "BANK_STATEMENT"],
+        "optional": ["DRIVING_LICENSE", "VOTER_ID", "PASSPORT"],
+        "additional": [],
+        "min_bank_statement_months": 3,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# check_completeness
+# ---------------------------------------------------------------------------
+
+def _check_completeness(params: dict, context: dict) -> dict:
+    """Check if a loan application folder has all required documents."""
+    t0 = time.monotonic()
+    folder_path = params.get("path", "").strip()
+    loan_type = params.get("loan_type", "default").strip().lower()
+
+    if not folder_path:
+        return _error("MISSING_PATH", "I need the path to the application folder")
+
+    folder_path = str(Path(folder_path).expanduser().resolve())
+    if not os.path.isdir(folder_path):
+        return _error("NOT_A_FOLDER", "That path is not a folder")
+
+    granted = context.get("granted_paths", [])
+    if granted and not _is_path_allowed(folder_path, granted):
+        return _error("PATH_NOT_GRANTED", "I don't have access to that location")
+
+    requirements = LOAN_REQUIREMENTS.get(loan_type, LOAN_REQUIREMENTS["default"])
+
+    if context.get("dry_run"):
+        return {
+            "status": "success",
+            "action_performed": f"Would check completeness for {requirements['display_name']} application",
+            "result": {"preview": f"Check {folder_path} against {loan_type} requirements"},
+            "metadata": _meta(paths_accessed=[folder_path]),
+        }
+
+    # Classify all documents in the folder
+    files: list[str] = []
+    for fn in os.listdir(folder_path):
+        full = os.path.join(folder_path, fn)
+        if os.path.isfile(full) and Path(fn).suffix.lower() in SUPPORTED_EXTENSIONS:
+            files.append(full)
+
+    found_types: dict[str, str] = {}  # type → filename
+    for fp in files:
+        try:
+            ext = Path(fp).suffix.lower()
+            text = _extract_text_from_pdf(fp) if ext == ".pdf" else _extract_text_from_image(fp)
+            detected, confidence, _ = _classify_text(text)
+            if detected != "UNKNOWN" and confidence > 0.3:
+                found_types[detected] = Path(fp).name
+        except Exception:
+            pass
+
+    # Check against requirements
+    required = set(requirements["required"])
+    optional = set(requirements.get("optional", []))
+    present_required = required & set(found_types.keys())
+    missing_required = required - set(found_types.keys())
+    present_optional = optional & set(found_types.keys())
+
+    completeness_pct = int(len(present_required) / len(required) * 100) if required else 100
+
+    if completeness_pct == 100:
+        status_text = "COMPLETE"
+        action_msg = f"Application is complete for {requirements['display_name']}"
+    elif completeness_pct >= 50:
+        status_text = "INCOMPLETE"
+        action_msg = f"Application is incomplete — {len(missing_required)} required document(s) missing"
+    else:
+        status_text = "INSUFFICIENT"
+        action_msg = f"Application has insufficient documents — only {len(present_required)} of {len(required)} required"
+
+    # Build document checklist
+    checklist: list[dict] = []
+    for doc_type in sorted(required):
+        display = DOCUMENT_PATTERNS.get(doc_type, {}).get("display_name", doc_type)
+        checklist.append({
+            "document": display,
+            "type": doc_type,
+            "required": True,
+            "present": doc_type in found_types,
+            "filename": found_types.get(doc_type, ""),
+        })
+    for doc_type in sorted(optional):
+        display = DOCUMENT_PATTERNS.get(doc_type, {}).get("display_name", doc_type)
+        checklist.append({
+            "document": display,
+            "type": doc_type,
+            "required": False,
+            "present": doc_type in found_types,
+            "filename": found_types.get(doc_type, ""),
+        })
+
+    # Additional documents (non-KYC, check by filename only)
+    additional_found: list[str] = []
+    additional_missing: list[str] = []
+    for add_doc in requirements.get("additional", []):
+        found = any(add_doc.replace("_", " ") in Path(fp).stem.lower().replace("_", " ")
+                     for fp in files)
+        if found:
+            additional_found.append(add_doc)
+        else:
+            additional_missing.append(add_doc)
+
+    elapsed = int((time.monotonic() - t0) * 1000)
+    return {
+        "status": "success",
+        "action_performed": action_msg,
+        "result": {
+            "loan_type": loan_type,
+            "loan_display": requirements["display_name"],
+            "completeness": f"{completeness_pct}%",
+            "application_status": status_text,
+            "total_files": len(files),
+            "documents_found": len(found_types),
+            "required_present": len(present_required),
+            "required_total": len(required),
+            "missing_required": [
+                DOCUMENT_PATTERNS.get(t, {}).get("display_name", t)
+                for t in sorted(missing_required)
+            ],
+            "optional_present": len(present_optional),
+            "checklist": checklist,
+            "additional_found": additional_found,
+            "additional_missing": additional_missing,
+            "summary": action_msg,
+        },
+        "metadata": _meta(
+            files_affected=len(files),
+            duration_ms=elapsed,
+            paths_accessed=[folder_path],
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# cross_verify
+# ---------------------------------------------------------------------------
+
+def _cross_verify(params: dict, context: dict) -> dict:
+    """Cross-verify data across multiple KYC documents for the same applicant."""
+    t0 = time.monotonic()
+    documents = params.get("documents", [])
+
+    if not documents or len(documents) < 2:
+        return _error("INSUFFICIENT_DOCUMENTS", "I need at least 2 documents to cross-verify")
+
+    if context.get("dry_run"):
+        return {
+            "status": "success",
+            "action_performed": f"Would cross-verify {len(documents)} documents",
+            "result": {"preview": f"Cross-verify {len(documents)} documents"},
+            "metadata": _meta(),
+        }
+
+    # Extract fields from each document
+    doc_data: list[dict] = []
+    paths_accessed: list[str] = []
+
+    for doc_info in documents:
+        doc_path = doc_info.get("path", "").strip()
+        doc_type = doc_info.get("type", "").strip().upper()
+        entry = {"type": doc_type, "path": doc_path, "fields": {}}
+
+        if doc_path:
+            doc_path = str(Path(doc_path).expanduser().resolve())
+            paths_accessed.append(doc_path)
+            granted = context.get("granted_paths", [])
+            if granted and not _is_path_allowed(doc_path, granted):
+                continue
+            try:
+                if os.path.exists(doc_path):
+                    ext = Path(doc_path).suffix.lower()
+                    text = _extract_text_from_pdf(doc_path) if ext == ".pdf" else _extract_text_from_image(doc_path)
+                    entry["fields"] = _extract_fields_from_text(text, doc_type)
+            except Exception:
+                pass
+
+        doc_data.append(entry)
+
+    # Cross-verification checks
+    mismatches: list[dict] = []
+    warnings: list[str] = []
+    matches: list[str] = []
+
+    # Collect all names found
+    names: list[dict] = []
+    for d in doc_data:
+        name = d["fields"].get("name", "").strip()
+        if name:
+            names.append({"document": d["type"], "name": name})
+
+    # Check name consistency
+    if len(names) >= 2:
+        base_name = names[0]["name"].lower()
+        for other in names[1:]:
+            other_name = other["name"].lower()
+            similarity = _name_similarity(base_name, other_name)
+            if similarity >= 0.9:
+                matches.append(
+                    f"Name match: '{names[0]['name']}' ({names[0]['document']}) "
+                    f"≈ '{other['name']}' ({other['document']})"
+                )
+            elif similarity >= 0.5:
+                warnings.append(
+                    f"Name variation: '{names[0]['name']}' ({names[0]['document']}) "
+                    f"vs '{other['name']}' ({other['document']}) — likely same person but verify"
+                )
+            else:
+                mismatches.append({
+                    "field": "name",
+                    "doc1": names[0]["document"],
+                    "value1": names[0]["name"],
+                    "doc2": other["document"],
+                    "value2": other["name"],
+                    "severity": "HIGH",
+                    "message": f"Name mismatch: '{names[0]['name']}' vs '{other['name']}'"
+                })
+
+    # Check DOB consistency
+    dobs: list[dict] = []
+    for d in doc_data:
+        dob = d["fields"].get("dob", "").strip()
+        if dob:
+            dobs.append({"document": d["type"], "dob": dob})
+
+    if len(dobs) >= 2:
+        base_dob = dobs[0]["dob"]
+        for other in dobs[1:]:
+            if _normalize_date(base_dob) == _normalize_date(other["dob"]):
+                matches.append(f"DOB match across {dobs[0]['document']} and {other['document']}")
+            else:
+                mismatches.append({
+                    "field": "dob",
+                    "doc1": dobs[0]["document"],
+                    "value1": base_dob,
+                    "doc2": other["document"],
+                    "value2": other["dob"],
+                    "severity": "HIGH",
+                    "message": f"Date of birth mismatch: {base_dob} vs {other['dob']}"
+                })
+
+    # Check document number uniqueness (same type shouldn't appear twice with different numbers)
+    doc_numbers: dict[str, list] = {}
+    for d in doc_data:
+        for field_name in ("uid_number", "pan_number", "passport_number", "epic_number", "dl_number"):
+            val = d["fields"].get(field_name, "").strip()
+            if val:
+                key = f"{d['type']}_{field_name}"
+                doc_numbers.setdefault(key, []).append(val)
+
+    # Determine overall verification status
+    if mismatches:
+        verification_status = "DISCREPANCIES_FOUND"
+        confidence = max(0.3, 1.0 - len(mismatches) * 0.2)
+    elif warnings:
+        verification_status = "REVIEW_RECOMMENDED"
+        confidence = 0.75
+    else:
+        verification_status = "CONSISTENT"
+        confidence = 0.95
+
+    elapsed = int((time.monotonic() - t0) * 1000)
+    return {
+        "status": "success",
+        "action_performed": f"Cross-verified {len(documents)} documents — {verification_status.lower().replace('_', ' ')}",
+        "result": {
+            "documents_checked": len(doc_data),
+            "verification_status": verification_status,
+            "confidence": round(confidence, 2),
+            "matches": matches,
+            "mismatches": mismatches,
+            "warnings": warnings,
+            "summary": (
+                f"Verified {len(doc_data)} documents. "
+                f"{len(matches)} field(s) consistent, "
+                f"{len(mismatches)} mismatch(es), "
+                f"{len(warnings)} warning(s)."
+            ),
+        },
+        "metadata": _meta(
+            files_affected=len(documents),
+            duration_ms=elapsed,
+            paths_accessed=paths_accessed,
+        ),
+    }
+
+
+def _name_similarity(name1: str, name2: str) -> float:
+    """Simple name similarity score (0-1) handling Indian name variations."""
+    if name1 == name2:
+        return 1.0
+
+    # Tokenize and compare
+    tokens1 = set(name1.lower().split())
+    tokens2 = set(name2.lower().split())
+
+    if not tokens1 or not tokens2:
+        return 0.0
+
+    # Check if one is a subset of the other (e.g., "R Kumar" vs "Rajesh Kumar")
+    if tokens1.issubset(tokens2) or tokens2.issubset(tokens1):
+        return 0.85
+
+    # Jaccard similarity on tokens
+    intersection = tokens1 & tokens2
+    union = tokens1 | tokens2
+    jaccard = len(intersection) / len(union) if union else 0.0
+
+    # Check initial matching (R. Kumar vs Rajesh Kumar)
+    initials1 = {t[0] for t in tokens1 if t}
+    initials2 = {t[0] for t in tokens2 if t}
+    initial_overlap = len(initials1 & initials2) / max(len(initials1), len(initials2)) if initials1 and initials2 else 0
+
+    return max(jaccard, initial_overlap * 0.7)
+
+
+def _normalize_date(date_str: str) -> str:
+    """Normalize date string for comparison (handles DD/MM/YYYY, DD-MM-YYYY, etc)."""
+    cleaned = date_str.strip().replace("/", "-").replace(".", "-")
+    parts = cleaned.split("-")
+    if len(parts) == 3:
+        # Normalize to YYYY-MM-DD
+        if len(parts[0]) == 4:
+            return cleaned  # Already YYYY-MM-DD
+        if len(parts[2]) == 4:
+            return f"{parts[2]}-{parts[1]}-{parts[0]}"  # DD-MM-YYYY → YYYY-MM-DD
+    return cleaned
+
+
 _REQUIRED_KYC_DOCS = {"AADHAAR", "PAN", "BANK_STATEMENT", "DRIVING_LICENSE"}
 
 
@@ -717,6 +1086,8 @@ _ACTIONS = {
     "classify_batch": _classify_batch,
     "extract_kyc_fields": _extract_kyc_fields,
     "generate_credit_summary": _generate_credit_summary,
+    "check_completeness": _check_completeness,
+    "cross_verify": _cross_verify,
 }
 
 

@@ -197,7 +197,7 @@ _AGENT_MANIFESTS: Dict[str, Dict[str, Any]] = {
     },
     "kyc_agent": {
         "version": "1.0.0",
-        "actions": ["classify_document", "classify_batch", "extract_kyc_fields", "generate_credit_summary"],
+        "actions": ["classify_document", "classify_batch", "extract_kyc_fields", "generate_credit_summary", "check_completeness", "cross_verify"],
         "permissions": ["~/Documents", "~/Downloads", "~/Desktop"],
         "sandbox_policy": "ReadOnly",
     },

@@ -420,3 +420,212 @@ class TestRunEntryPoint:
         })
         assert result["status"] == "error"
         assert result["error"]["code"] == "UNKNOWN_ACTION"
+
+
+# ---------------------------------------------------------------------------
+# check_completeness
+# ---------------------------------------------------------------------------
+
+class TestCheckCompleteness:
+    def test_complete_home_loan(self, tmp_path, monkeypatch):
+        """Folder with Aadhaar, PAN, Bank Statement → 100% complete for home loan."""
+        # Create test files
+        (tmp_path / "aadhaar.pdf").write_bytes(b"%PDF-1.4 test")
+        (tmp_path / "pan_card.pdf").write_bytes(b"%PDF-1.4 test")
+        (tmp_path / "bank_statement.pdf").write_bytes(b"%PDF-1.4 test")
+
+        # Patch text extraction to return classifiable text
+        texts = {
+            "aadhaar.pdf": "Unique Identification Authority aadhaar 1234 5678 9012",
+            "pan_card.pdf": "Income Tax Department ABCDE1234F permanent account number",
+            "bank_statement.pdf": "Account Statement balance transaction credit debit IFSC branch",
+        }
+        import capabilities.kyc_agent.agent as kyc
+        monkeypatch.setattr(kyc, "_extract_text_from_pdf",
+                            lambda fp: texts.get(os.path.basename(fp), ""))
+
+        result = run({
+            "action": "check_completeness",
+            "params": {"path": str(tmp_path), "loan_type": "home_loan"},
+            "context": {"granted_paths": [str(tmp_path)]},
+        })
+        assert result["status"] == "success"
+        assert result["result"]["completeness"] == "100%"
+        assert result["result"]["application_status"] == "COMPLETE"
+        assert len(result["result"]["missing_required"]) == 0
+
+    def test_incomplete_application(self, tmp_path, monkeypatch):
+        """Folder with only Aadhaar → incomplete for home loan."""
+        (tmp_path / "aadhaar.pdf").write_bytes(b"%PDF-1.4 test")
+
+        import capabilities.kyc_agent.agent as kyc
+        monkeypatch.setattr(kyc, "_extract_text_from_pdf",
+                            lambda fp: "Unique Identification Authority aadhaar 1234 5678 9012")
+
+        result = run({
+            "action": "check_completeness",
+            "params": {"path": str(tmp_path), "loan_type": "home_loan"},
+            "context": {"granted_paths": [str(tmp_path)]},
+        })
+        assert result["status"] == "success"
+        assert result["result"]["application_status"] in ("INCOMPLETE", "INSUFFICIENT")
+        assert len(result["result"]["missing_required"]) > 0
+
+    def test_dry_run(self, tmp_path):
+        result = run({
+            "action": "check_completeness",
+            "params": {"path": str(tmp_path), "loan_type": "personal_loan"},
+            "context": {"granted_paths": [str(tmp_path)], "dry_run": True},
+        })
+        assert result["status"] == "success"
+        assert "preview" in result["result"]
+
+    def test_missing_folder(self):
+        result = run({
+            "action": "check_completeness",
+            "params": {"path": "/nonexistent/folder"},
+            "context": {},
+        })
+        assert result["status"] == "error"
+
+    def test_checklist_structure(self, tmp_path, monkeypatch):
+        """Checklist should have required and optional entries."""
+        (tmp_path / "pan.pdf").write_bytes(b"%PDF-1.4 test")
+        import capabilities.kyc_agent.agent as kyc
+        monkeypatch.setattr(kyc, "_extract_text_from_pdf",
+                            lambda fp: "Income Tax ABCDE1234F permanent account number")
+
+        result = run({
+            "action": "check_completeness",
+            "params": {"path": str(tmp_path), "loan_type": "personal_loan"},
+            "context": {"granted_paths": [str(tmp_path)]},
+        })
+        checklist = result["result"]["checklist"]
+        assert any(item["required"] for item in checklist)
+        assert any(item["present"] for item in checklist)
+
+
+# ---------------------------------------------------------------------------
+# cross_verify
+# ---------------------------------------------------------------------------
+
+class TestCrossVerify:
+    def test_consistent_documents(self, tmp_path, monkeypatch):
+        """Two docs with matching name and DOB → CONSISTENT."""
+        (tmp_path / "aadhaar.pdf").write_bytes(b"%PDF-1.4 test")
+        (tmp_path / "pan.pdf").write_bytes(b"%PDF-1.4 test")
+
+        texts = {
+            "aadhaar.pdf": "Unique Identification aadhaar Rajesh Kumar DOB: 15/06/1990 1234 5678 9012",
+            "pan.pdf": "Income Tax ABCDE1234F Rajesh Kumar Date of Birth 15/06/1990",
+        }
+        import capabilities.kyc_agent.agent as kyc
+        monkeypatch.setattr(kyc, "_extract_text_from_pdf",
+                            lambda fp: texts.get(os.path.basename(fp), ""))
+
+        result = run({
+            "action": "cross_verify",
+            "params": {
+                "documents": [
+                    {"path": str(tmp_path / "aadhaar.pdf"), "type": "AADHAAR"},
+                    {"path": str(tmp_path / "pan.pdf"), "type": "PAN"},
+                ],
+            },
+            "context": {"granted_paths": [str(tmp_path)]},
+        })
+        assert result["status"] == "success"
+        assert result["result"]["verification_status"] in ("CONSISTENT", "REVIEW_RECOMMENDED")
+
+    def test_name_mismatch(self, tmp_path, monkeypatch):
+        """Two docs with different names → DISCREPANCIES_FOUND.
+
+        We monkeypatch _extract_fields_from_text to simulate name extraction
+        since the regex-based extractor needs very specific text formatting.
+        """
+        (tmp_path / "aadhaar.pdf").write_bytes(b"%PDF-1.4 test")
+        (tmp_path / "pan.pdf").write_bytes(b"%PDF-1.4 test")
+
+        texts = {
+            "aadhaar.pdf": "Unique Identification aadhaar 1234 5678 9012",
+            "pan.pdf": "Income Tax ABCDE1234F",
+        }
+        import capabilities.kyc_agent.agent as kyc
+        monkeypatch.setattr(kyc, "_extract_text_from_pdf",
+                            lambda fp: texts.get(os.path.basename(fp), ""))
+
+        # Monkeypatch field extraction to return different names
+        original_extract = kyc._extract_fields_from_text
+        def mock_extract(text, doc_type):
+            fields = original_extract(text, doc_type)
+            if "aadhaar" in text:
+                fields["name"] = "Rajesh Kumar"
+            elif "Income Tax" in text:
+                fields["name"] = "Suresh Mehta"
+            return fields
+        monkeypatch.setattr(kyc, "_extract_fields_from_text", mock_extract)
+
+        result = run({
+            "action": "cross_verify",
+            "params": {
+                "documents": [
+                    {"path": str(tmp_path / "aadhaar.pdf"), "type": "AADHAAR"},
+                    {"path": str(tmp_path / "pan.pdf"), "type": "PAN"},
+                ],
+            },
+            "context": {"granted_paths": [str(tmp_path)]},
+        })
+        assert result["status"] == "success"
+        assert result["result"]["verification_status"] == "DISCREPANCIES_FOUND"
+        assert len(result["result"]["mismatches"]) > 0
+
+    def test_name_variation(self, tmp_path, monkeypatch):
+        """'R Kumar' vs 'Rajesh Kumar' → warning, not mismatch."""
+        (tmp_path / "a.pdf").write_bytes(b"%PDF-1.4 test")
+        (tmp_path / "b.pdf").write_bytes(b"%PDF-1.4 test")
+
+        texts = {
+            "a.pdf": "Unique Identification aadhaar Rajesh Kumar 1234 5678 9012",
+            "b.pdf": "Income Tax ABCDE1234F R Kumar",
+        }
+        import capabilities.kyc_agent.agent as kyc
+        monkeypatch.setattr(kyc, "_extract_text_from_pdf",
+                            lambda fp: texts.get(os.path.basename(fp), ""))
+
+        result = run({
+            "action": "cross_verify",
+            "params": {
+                "documents": [
+                    {"path": str(tmp_path / "a.pdf"), "type": "AADHAAR"},
+                    {"path": str(tmp_path / "b.pdf"), "type": "PAN"},
+                ],
+            },
+            "context": {"granted_paths": [str(tmp_path)]},
+        })
+        assert result["status"] == "success"
+        # Should be a warning or match, not a hard mismatch
+        status = result["result"]["verification_status"]
+        assert status in ("CONSISTENT", "REVIEW_RECOMMENDED")
+
+    def test_insufficient_documents(self):
+        """Less than 2 documents → error."""
+        result = run({
+            "action": "cross_verify",
+            "params": {"documents": [{"path": "/tmp/x.pdf", "type": "AADHAAR"}]},
+            "context": {},
+        })
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "INSUFFICIENT_DOCUMENTS"
+
+    def test_dry_run(self):
+        result = run({
+            "action": "cross_verify",
+            "params": {
+                "documents": [
+                    {"path": "/tmp/a.pdf", "type": "AADHAAR"},
+                    {"path": "/tmp/b.pdf", "type": "PAN"},
+                ],
+            },
+            "context": {"dry_run": True},
+        })
+        assert result["status"] == "success"
+        assert "preview" in result["result"]
