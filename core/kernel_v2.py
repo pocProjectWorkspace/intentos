@@ -145,6 +145,7 @@ AGENT_REGISTRY: Dict[str, str] = {
     "document_agent": "capabilities.document_agent.agent",
     "image_agent": "capabilities.image_agent.agent",
     "media_agent": "capabilities.media_agent.agent",
+    "kyc_agent": "capabilities.kyc_agent.agent",
 }
 
 # Agent manifests for the scheduler
@@ -193,6 +194,12 @@ _AGENT_MANIFESTS: Dict[str, Dict[str, Any]] = {
         "actions": ["get_info", "convert", "trim", "extract_audio", "compress"],
         "permissions": ["~/Documents", "~/Downloads", "~/Desktop"],
         "sandbox_policy": "WorkspaceWrite",
+    },
+    "kyc_agent": {
+        "version": "1.0.0",
+        "actions": ["classify_document", "classify_batch", "extract_kyc_fields", "generate_credit_summary"],
+        "permissions": ["~/Documents", "~/Downloads", "~/Desktop"],
+        "sandbox_policy": "ReadOnly",
     },
 }
 

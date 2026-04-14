@@ -1,0 +1,11 @@
+{
+    "name": "kyc_agent",
+    "version": "1.0.0",
+    "description": "Classifies and verifies Indian KYC documents (Aadhaar, PAN, Passport, Voter ID, Driving License)",
+    "category": "document",
+    "permissions": ["filesystem.read"],
+    "optional_permissions": [],
+    "actions": ["classify_document", "classify_batch", "extract_kyc_fields", "generate_credit_summary"],
+    "sandbox_policy": "ReadOnly",
+    "platforms": ["linux", "macos", "windows"]
+}

@@ -120,12 +120,12 @@ class TestKernelInit:
 
 class TestAgentRegistration:
     def test_register_agents_populates_scheduler(self, kernel):
-        """_register_agents populates scheduler with all 6 agents."""
+        """_register_agents populates scheduler with all 7 agents."""
         registered = kernel.scheduler.list_agents()
-        assert len(registered) == 6
+        assert len(registered) == 7
         expected_agents = {
             "file_agent", "browser_agent", "document_agent",
-            "system_agent", "image_agent", "media_agent",
+            "system_agent", "image_agent", "media_agent", "kyc_agent",
         }
         assert set(registered) == expected_agents
 
@@ -333,7 +333,7 @@ class TestCommandStatus:
         assert "CPU" in output
         assert "RAM" in output
         assert "Agents" in output
-        assert "6 registered" in output
+        assert "7 registered" in output
 
 
 # ---------------------------------------------------------------------------
